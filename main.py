@@ -111,6 +111,8 @@ class FuturesVWAPAlgo:
         self.sl_price       = 0.0
         self.target_price   = 0.0
         self.peak_price     = 0.0
+        self.low_price      = 0.0   # lowest option LTP seen during trade
+        self.trail_step     = ""    # last trail step label hit
         self.trail_active   = False
         self.qty            = config.LOTS * config.LOT_SIZE
         self.option_ltp     = 0.0
@@ -121,10 +123,19 @@ class FuturesVWAPAlgo:
         self.consec_sl          = 0   # consecutive SL hits
         self.day_stopped        = False
 
+        # Early session (9:16–9:39) counters
+        self.early_trade_count  = 0          # trades taken in early session
+        self.early_last_result  = None       # 'win' | 'loss' | None
+        self.early_last_entry_t = None       # datetime of last early entry
+
         # Direction fatigue tracking
         # {direction: {'wins': N, 'last_win_time': datetime}}
         self._dir_wins: dict      = {"CE": {"wins": 0, "last_win_time": None},
                                      "PE": {"wins": 0, "last_win_time": None}}
+
+        # Pullback trade counter per direction — resets each day
+        # Max MAX_PULLBACK_PER_DIR pullback entries allowed per direction
+        self._pullback_count: dict = {"CE": 0, "PE": 0}
 
         # Pre-load flag
         self._preloaded         = False
@@ -201,22 +212,47 @@ class FuturesVWAPAlgo:
 
     def _preload_at_startup(self):
         """
-        Fetch Nifty spot from index quote at startup and run preload_strikes()
-        synchronously — before WS starts, so all data is ready before 9:15.
-        Falls back to trigger on first futures tick if index quote fails.
+        Fetch spot from the Nifty futures token quote (already resolved, no
+        separate index API call). Falls back to index quote then to a fixed
+        estimate so preload ALWAYS runs at startup — never waits for first tick.
         """
-        spot = self._fetch_nifty_spot()
+        # Try futures token first (most reliable — same token WS uses)
+        spot = self._fetch_spot_from_futures_token()
         if spot <= 0:
-            print("[PreLoad] Could not fetch Nifty spot at startup — "
-                  "will preload on first futures tick")
-            return
-        print(f"[PreLoad] Startup spot: {spot:.0f} (from Nifty index quote)")
+            spot = self._fetch_nifty_spot()   # try index token
+        if spot <= 0:
+            spot = 24000.0   # fixed estimate — cache covers ±500pts so still useful
+            print(f"[PreLoad] Spot fetch failed — using estimate {spot:.0f}")
+
+        print(f"[PreLoad] Startup spot: {spot:.0f} — pre-loading strikes now...")
         try:
             self.opt_mgr.preload_strikes(spot)
             self._preloaded = True
+            print("[PreLoad] ✅ Startup pre-load done — ready before 9:15")
         except Exception as e:
             self.logger.error(f"[PreLoad] Startup error: {e}", exc_info=True)
-            print(f"[PreLoad] Preload failed ({e}) — will retry on first futures tick")
+            print(f"[PreLoad] ⚠️  Preload error: {e}")
+
+    def _fetch_spot_from_futures_token(self) -> float:
+        """Fetch LTP from the Nifty futures token — no index quote needed."""
+        if not self.futures_token:
+            return 0.0
+        try:
+            resp = self.client.quotes(
+                instrument_tokens=[{"instrument_token": self.futures_token,
+                                    "exchange_segment": config.FO_SEGMENT}],
+                quote_type="ltp",
+            )
+            data = resp if isinstance(resp, list) else (
+                   resp.get("message") or resp.get("data") or [] if isinstance(resp, dict) else [])
+            if data:
+                for f in ("ltp", "ltP", "last_price", "lastPrice", "close"):
+                    v = data[0].get(f)
+                    if v and float(v) > 0:
+                        return float(v)
+        except Exception as e:
+            self.logger.debug(f"_fetch_spot_from_futures_token: {e}")
+        return 0.0
 
     def _fetch_nifty_spot(self) -> float:
         """Fetch current Nifty 50 index LTP (used for startup pre-load)."""
@@ -297,6 +333,33 @@ class FuturesVWAPAlgo:
 
     def _on_ws_close(self, *args):
         self.logger.warning("[WS] Closed")
+        if self._running:
+            threading.Thread(target=self._ws_reconnect_loop,
+                             daemon=True, name="WSReconnect").start()
+
+    def _ws_reconnect_loop(self):
+        """
+        Auto-reconnect on WS drop (WinError 10060 / network blip).
+        Retries with backoff: 5s → 10s → 20s → 30s (cap).
+        """
+        delays = [5, 10, 20, 30]
+        for attempt, delay in enumerate(delays, 1):
+            if not self._running:
+                return
+            print(f"\n[WS] Reconnect attempt {attempt}/{len(delays)} in {delay}s...")
+            time.sleep(delay)
+            if not self._running:
+                return
+            try:
+                self._setup_websocket()
+                self._subscribe_futures()
+                if self.option_token:
+                    self._subscribe_option(self.option_token)
+                print(f"[WS] ✅ Reconnected (attempt {attempt})")
+                return
+            except Exception as e:
+                self.logger.error(f"[WS] Reconnect attempt {attempt} failed: {e}")
+        print("[WS] ❌ All reconnect attempts failed — session manager will handle")
 
     def _subscribe_futures(self):
         if not self.futures_token:
@@ -369,10 +432,6 @@ class FuturesVWAPAlgo:
         state = self.futures_engine.get_state()
         ltp   = state["ltp"]
 
-        # Fallback preload on first futures tick if startup preload failed
-        if not self._preloaded and ltp > 0:
-            self._trigger_preload(ltp)
-
         if not self._is_market_hours(now_ist()):
             return
 
@@ -435,26 +494,47 @@ class FuturesVWAPAlgo:
         self.option_ltp = ltp
         if ltp > self.peak_price:
             self.peak_price = ltp
+        if self.low_price == 0.0 or ltp < self.low_price:
+            self.low_price = ltp
 
         profit_pts = ltp - self.entry_price
+        now_t      = now_ist().time()
+        early_end  = datetime.time(*map(int, config.EARLY_SESSION_END.split(":")))
+        is_early   = now_t < early_end
 
-        # ── Trailing SL — two-step ratchet ───────────────
-        # Step 1: +20 pts → move SL to breakeven (entry price)
-        # Step 2: +30 pts → move SL to entry + 10 pts (locked forever)
-        if profit_pts >= config.TRAIL_LOCK_TRIGGER:
-            lock_sl = round(self.entry_price + config.TRAIL_LOCK_PTS, 2)
-            if lock_sl > self.sl_price:
-                self.logger.info(f"[Trail] LOCK  SL {self.sl_price:.2f} → {lock_sl:.2f} "
-                                 f"(+{profit_pts:.1f}pts ≥ +{config.TRAIL_LOCK_TRIGGER})")
-                self.sl_price     = lock_sl
-                self.trail_active = True
-        elif profit_pts >= config.TRAIL_BREAKEVEN_TRIGGER:
-            be_sl = round(self.entry_price, 2)
-            if be_sl > self.sl_price:
-                self.logger.info(f"[Trail] BE    SL {self.sl_price:.2f} → {be_sl:.2f} "
-                                 f"(+{profit_pts:.1f}pts ≥ +{config.TRAIL_BREAKEVEN_TRIGGER})")
-                self.sl_price     = be_sl
-                self.trail_active = True
+        # ── Trailing SL ───────────────────────────────────
+        new_sl = self.sl_price
+
+        if is_early:
+            # Early session ladder: 25→entry+5, 35→entry+25
+            if profit_pts >= config.EARLY_TRAIL_2_TRIGGER:
+                new_sl = round(self.entry_price + config.EARLY_TRAIL_2_LOCK, 2)
+            elif profit_pts >= config.EARLY_TRAIL_1_TRIGGER:
+                new_sl = round(self.entry_price + config.EARLY_TRAIL_1_LOCK, 2)
+        else:
+            # Normal session ladder: 20→+1, 30→+10, 35→+20, 40→+25, then trail every 5
+            if profit_pts >= config.NORMAL_TRAIL_STEP_START:
+                # Continuous trail every 5 pts from +45 onward
+                steps  = int((profit_pts - config.NORMAL_TRAIL_STEP_START)
+                             / config.NORMAL_TRAIL_STEP_SIZE)
+                offset = config.NORMAL_TRAIL_4_LOCK + steps * config.NORMAL_TRAIL_STEP_SIZE
+                new_sl = round(self.entry_price + offset, 2)
+            elif profit_pts >= config.NORMAL_TRAIL_4_TRIGGER:
+                new_sl = round(self.entry_price + config.NORMAL_TRAIL_4_LOCK, 2)
+            elif profit_pts >= config.NORMAL_TRAIL_3_TRIGGER:
+                new_sl = round(self.entry_price + config.NORMAL_TRAIL_3_LOCK, 2)
+            elif profit_pts >= config.NORMAL_TRAIL_2_TRIGGER:
+                new_sl = round(self.entry_price + config.NORMAL_TRAIL_2_LOCK, 2)
+            elif profit_pts >= config.NORMAL_TRAIL_1_TRIGGER:
+                new_sl = round(self.entry_price + config.NORMAL_TRAIL_1_LOCK, 2)
+
+        if new_sl > self.sl_price:
+            self.logger.info(f"[Trail] SL {self.sl_price:.2f} → {new_sl:.2f} "
+                             f"(+{profit_pts:.1f}pts {'early' if is_early else 'normal'})")
+            print(f"  [Trail] SL moved {self.sl_price:.2f} → {new_sl:.2f}")
+            self.sl_price     = new_sl
+            self.trail_active = True
+            self.trail_step   = f"+{profit_pts:.0f}pts→SL+{new_sl - self.entry_price:.0f}"
 
         # ── Target check ──────────────────────────────────
         if ltp >= self.target_price:
@@ -526,12 +606,74 @@ class FuturesVWAPAlgo:
             if t.time() >= cutoff:
                 return
 
+        # ── Early session guard (9:16–9:39) ──────────────
+        early_end = datetime.time(*map(int, config.EARLY_SESSION_END.split(":")))
+        is_early  = t.time() < early_end
+
+        if is_early:
+            # Max 2 trades in early session
+            if self.early_trade_count >= config.EARLY_SESSION_MAX_TRADES:
+                self.logger.info("[EarlyGuard] 2 trades done — blocked until 9:40")
+                print("[EarlyGuard] Max 2 early trades reached — waiting for 9:40")
+                return
+
+            # After a loss: wait 10 min from last entry time before 2nd trade
+            if (self.early_last_result == "loss" and
+                    self.early_last_entry_t is not None):
+                wait_secs = config.EARLY_LOSS_WAIT_MINS * 60
+                elapsed   = (t - self.early_last_entry_t).total_seconds()
+                if elapsed < wait_secs:
+                    remaining = int((wait_secs - elapsed) / 60) + 1
+                    self.logger.info(
+                        f"[EarlyGuard] Loss wait — {remaining}min remaining")
+                    print(f"[EarlyGuard] Last trade was a loss — "
+                          f"waiting {remaining}min more")
+                    return
+
         # ── Direction fatigue guard ───────────────────────
         if self._is_direction_fatigued(direction, t):
             self.logger.info(f"[Fatigue] {direction} fatigued — skipping")
             print(f"[Fatigue] {direction} skipped — {config.DIRECTION_FATIGUE_COUNT} wins, "
                   f"cooldown {config.DIRECTION_COOLDOWN_MINS} min")
             return
+
+        # ── VWAP trend filter ─────────────────────────────
+        # Applied only from 9:30 AM onward (but tracking starts at 9:15).
+        # CE only in rising VWAP trend; PE only in falling VWAP trend.
+        # 'flat' = not enough history or indeterminate → allow both.
+        trend_start = datetime.time(
+            *map(int, config.VWAP_TREND_START.split(":")))
+        if t.time() >= trend_start:
+            trend  = self.futures_engine.vwap_trend()
+            detail = self.futures_engine.vwap_trend_detail()
+            if trend == "falling" and direction == "CE":
+                self.logger.info(
+                    f"[TrendFilter] VWAP falling "
+                    f"({detail['oldest_vwap']:.2f}→{detail['newest_vwap']:.2f} "
+                    f"Δ{detail['change']:+.2f}) — CE skipped")
+                print(f"[TrendFilter] VWAP ↓ ({detail['change']:+.2f}pts "
+                      f"over {detail['snapshots']}min) — CE skipped")
+                return
+            if trend == "rising" and direction == "PE":
+                self.logger.info(
+                    f"[TrendFilter] VWAP rising "
+                    f"({detail['oldest_vwap']:.2f}→{detail['newest_vwap']:.2f} "
+                    f"Δ{detail['change']:+.2f}) — PE skipped")
+                print(f"[TrendFilter] VWAP ↑ ({detail['change']:+.2f}pts "
+                      f"over {detail['snapshots']}min) — PE skipped")
+                return
+
+        # ── Pullback trade limit ──────────────────────────
+        # Maximum MAX_PULLBACK_PER_DIR pullback entries per direction per day
+        if sig_type == "pullback":
+            count = self._pullback_count.get(direction, 0)
+            if count >= config.MAX_PULLBACK_PER_DIR:
+                self.logger.info(
+                    f"[PullbackLimit] {direction} pullback #{count} blocked "
+                    f"(max {config.MAX_PULLBACK_PER_DIR})")
+                print(f"[PullbackLimit] {direction} pullback limit reached "
+                      f"({config.MAX_PULLBACK_PER_DIR}/day) — skipped")
+                return
 
         # ── Close opposite trade if open ──────────────────
         if self.in_trade and self.direction != direction:
@@ -581,27 +723,59 @@ class FuturesVWAPAlgo:
         self.in_trade     = True
         self.direction    = direction
         self.entry_type   = sig_type
+
+        # Increment pullback counter for this direction
+        if sig_type == "pullback":
+            self._pullback_count[direction] = self._pullback_count.get(direction, 0) + 1
+            self.logger.info(
+                f"[PullbackCount] {direction} pullback count now "
+                f"{self._pullback_count[direction]}/{config.MAX_PULLBACK_PER_DIR}")
+        # Determine session and set SL/target accordingly
+        early_end = datetime.time(*map(int, config.EARLY_SESSION_END.split(":")))
+        is_early  = t.time() < early_end
+        if is_early:
+            used_sl     = config.EARLY_SL_PTS
+            used_target = config.EARLY_TARGET_PTS
+            trail_desc  = (f"+{config.EARLY_TRAIL_1_TRIGGER}→+{config.EARLY_TRAIL_1_LOCK}, "
+                           f"+{config.EARLY_TRAIL_2_TRIGGER}→+{config.EARLY_TRAIL_2_LOCK}, "
+                           f"book@+{config.EARLY_TARGET_PTS}")
+        else:
+            used_sl     = config.NORMAL_SL_PTS
+            used_target = config.NORMAL_TARGET_PTS
+            trail_desc  = (f"+20→BE+1, +30→+10, +35→+20, +40→+25, "
+                           f"then trail every {config.NORMAL_TRAIL_STEP_SIZE}pts")
+
         self.strike       = info["strike"]
         self.option_token = info["token"]
         self.entry_price  = fill_px
         self.entry_time   = t
         self.entry_vwap   = futures_vwap
-        self.sl_price     = round(fill_px - self.sl_pts, 2)
-        self.target_price = round(fill_px + self.target_pts, 2)
+        self.sl_price     = round(fill_px - used_sl, 2)
+        self.target_price = round(fill_px + used_target, 2)
         self.peak_price   = fill_px
+        self.low_price    = fill_px
+        self.trail_step   = ""
         self.trail_active = False
         self.option_ltp   = fill_px
+        self.sl_pts       = used_sl
+        self.target_pts   = used_target
+
+        # Track early session state
+        if is_early:
+            self.early_trade_count  += 1
+            self.early_last_entry_t  = t
 
         self.trade_count += 1
         self._subscribe_option(info["token"])
 
-        print(f"\n✅ ENTRY #{self.trade_count}")
+        session_tag = "EARLY (9:16–9:39)" if is_early else "NORMAL (9:40+)"
+        print(f"\n✅ ENTRY #{self.trade_count}  [{session_tag}]")
         print(f"   Direction  : {direction}  ({sig_type.upper()})")
         print(f"   Strike     : {info['strike']}  exp={info['expiry_str']}")
         print(f"   Entry      : Rs {fill_px:.2f}")
-        print(f"   SL         : Rs {self.sl_price:.2f}  (−{self.sl_pts} pts)")
-        print(f"   Target     : Rs {self.target_price:.2f}  (+{self.target_pts} pts)")
-        print(f"   Trail      : +{config.TRAIL_BREAKEVEN_TRIGGER}pts→BE, +{config.TRAIL_LOCK_TRIGGER}pts→+{config.TRAIL_LOCK_PTS}pts locked")
+        print(f"   SL         : Rs {self.sl_price:.2f}  (−{used_sl} pts)")
+        print(f"   Target     : Rs {self.target_price:.2f}  (+{used_target} pts)")
+        print(f"   Trail      : {trail_desc}")
         print(f"   Futures    : {futures_ltp:.2f}  VWAP={futures_vwap:.2f}")
         print(f"   VIX regime : {'HIGH' if self.high_vix else 'LOW'} ({self.current_vix:.1f})")
 
@@ -643,6 +817,11 @@ class FuturesVWAPAlgo:
         else:
             self.consec_sl  = 0   # any non-SL exit resets streak
 
+        # Track early session result for loss-wait logic
+        early_end = datetime.time(*map(int, config.EARLY_SESSION_END.split(":")))
+        if exit_time.time() < early_end:
+            self.early_last_result = "loss" if pts_gained < 0 else "win"
+
         # ── Direction fatigue tracking ────────────────────
         if pts_gained >= config.FATIGUE_MIN_PROFIT_PTS:
             dw = self._dir_wins[self.direction]
@@ -666,29 +845,44 @@ class FuturesVWAPAlgo:
             pnl_pts=pts_gained, net_rs=net_rs, reason=reason,
         )
 
+        early_end  = datetime.time(*map(int, config.EARLY_SESSION_END.split(":")))
+        is_early_x = self.entry_time.time() < early_end
+        trend_det  = self.futures_engine.vwap_trend_detail()
+
         self.report_mgr.log_trade({
-            "entry_time"    : self.entry_time,
-            "exit_time"     : exit_time,
-            "direction"     : self.direction,
-            "strike"        : self.strike,
-            "expiry"        : self.opt_mgr.expiry_str,
-            "atm_at_entry"  : "",
-            "entry_price"   : self.entry_price,
-            "exit_price"    : exit_price,
-            "peak_price"    : self.peak_price,
-            "entry_vwap"    : self.entry_vwap,
-            "entry_dist"    : round(abs(self.entry_price - self.entry_vwap), 2),
-            "nifty_at_entry": self.futures_engine.ltp,
-            "nifty_at_exit" : self.futures_engine.ltp,
-            "pnl_rs"        : pnl_rs,
-            "total_cost"    : cost,
-            "net_rs"        : net_rs,
-            "exit_reason"   : reason,
-            "exit_phase"    : reason,
-            "target_points" : self.target_pts,
-            "target_reason" : f"VIX={'HIGH' if self.high_vix else 'LOW'} {self.current_vix:.1f}",
-            "breakeven_done": self.trail_active,
-            "trail_active"  : self.trail_active,
+            "entry_time"              : self.entry_time,
+            "exit_time"               : exit_time,
+            "direction"               : self.direction,
+            "strike"                  : self.strike,
+            "expiry"                  : self.opt_mgr.expiry_str,
+            "atm_at_entry"            : round(self.entry_vwap / 50) * 50,
+            "entry_price"             : self.entry_price,
+            "exit_price"              : exit_price,
+            "peak_price"              : self.peak_price,
+            "low_price"               : self.low_price,
+            "entry_vwap"              : self.entry_vwap,
+            "exit_vwap"               : self.futures_engine.vwap,
+            "entry_dist"              : round(abs(self.entry_price - self.entry_vwap), 2),
+            "futures_at_entry"        : self.futures_engine.ltp,
+            "futures_at_exit"         : self.futures_engine.ltp,
+            "pnl_rs"                  : pnl_rs,
+            "total_cost"              : cost,
+            "net_rs"                  : net_rs,
+            "exit_reason"             : reason,
+            "exit_phase"              : reason,
+            "breakeven_done"          : self.trail_active,
+            "trail_active"            : self.trail_active,
+            "trail_step_reached"      : self.trail_step,
+            "signal_type"             : self.entry_type,
+            "session"                 : "EARLY" if is_early_x else "NORMAL",
+            "sl_pts_used"             : self.sl_pts,
+            "target_pts_used"         : self.target_pts,
+            "sl_price"                : self.entry_price - self.sl_pts,
+            "target_price"            : self.entry_price + self.target_pts,
+            "vwap_trend_at_entry"     : trend_det.get("trend", ""),
+            "early_trade_count"       : self.early_trade_count if is_early_x else "",
+            "pullback_count_at_entry" : self._pullback_count.get(self.direction, 0),
+            "high_vix"                : self.high_vix,
         })
 
         if self.option_token:
@@ -751,10 +945,17 @@ class FuturesVWAPAlgo:
         t     = now_ist()
         state = self.futures_engine.get_state()
         pos   = "▲" if state["was_above"] else "▼"
+        detail    = self.futures_engine.vwap_trend_detail()
+        trend_sym = "↑" if detail["trend"] == "rising" else (
+                    "↓" if detail["trend"] == "falling" else "→")
+        pb_ce = self._pullback_count.get("CE", 0)
+        pb_pe = self._pullback_count.get("PE", 0)
         print(f"\n[{t.strftime('%H:%M:%S')}] "
               f"F={state['ltp']:.2f} VWAP={state['vwap']:.2f}{pos} "
+              f"Trend={trend_sym}({detail['change']:+.2f}/{detail['snapshots']}min) "
               f"VIX={self.current_vix:.1f} "
-              f"Trades={self.trade_count} ConsecSL={self.consec_sl}", end="")
+              f"Trades={self.trade_count} ConsecSL={self.consec_sl} "
+              f"PB(CE={pb_ce}/PE={pb_pe})", end="")
         if self.in_trade:
             unreal = round((self.option_ltp - self.entry_price) * self.qty, 0)
             trail_tag = "🔒" if self.trail_active else ""

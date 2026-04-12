@@ -34,27 +34,38 @@ class ReportManager:
         if not exists:
             self._writer.writerow([
                 # Identity
-                'Date', 'Trade#', 'Mode',
+                'Date', 'Trade#', 'Mode', 'Session',
                 # Timing
                 'Entry Time', 'Exit Time', 'Duration (mins)',
-                # Direction & strikes
-                'Direction', 'Strike', 'Expiry', 'ATM at Entry',
-                # Prices
-                'Option Entry', 'Option Exit', 'Option Peak',
-                'VWAP at Entry', 'Dist from VWAP (pts)',
-                # Nifty context
-                'Nifty at Entry', 'Nifty at Exit', 'Nifty Move',
-                # Points analysis
-                'Pts Gained', 'Pts Max Possible', 'Pts Missed',
+                # Signal
+                'Signal Type', 'Direction',
+                # Strike & expiry
+                'Strike', 'Expiry', 'ATM at Entry', 'ITM Depth (pts)',
+                # Option prices
+                'Option Entry', 'Option Exit', 'Option Peak', 'Option Low',
+                # Pts analysis
+                'Pts Gained', 'Pts Max (peak)', 'Pts Min (low)',
+                'Pts Missed', 'Max Adverse Excursion',
                 'Trail Efficiency %',
+                # VWAP context
+                'VWAP at Entry', 'Dist from VWAP (pts)', 'VWAP Trend at Entry',
+                'VWAP at Exit',
+                # Nifty / futures context
+                'Futures at Entry', 'Futures at Exit', 'Futures Move',
+                # SL & target setup
+                'SL Pts Used', 'Target Pts Used',
+                'SL Price', 'Target Price',
+                'Trail Step Reached',
                 # P&L
-                'Gross PnL', 'Cost', 'Net PnL',
-                'Capital After', 'Return on Capital %',
+                'Gross PnL Rs', 'Cost Rs', 'Net PnL Rs',
+                'Capital After Rs', 'Return on Capital %',
                 # Exit analysis
-                'Exit Phase', 'Exit Reason Short',
+                'Exit Reason', 'Exit Phase',
                 'Breakeven Triggered', 'Trail Triggered',
+                # Session guards
+                'Early Session Trade#', 'Pullback Count at Entry',
                 # Context
-                'VIX', 'Target Pts', 'Target Reason',
+                'VIX', 'High VIX Regime',
             ])
 
     def _init_daily_history(self):
@@ -71,69 +82,99 @@ class ReportManager:
     def log_trade(self, trade):
         self.trades.append(trade)
 
-        entry_dt = trade['entry_time']
-        exit_dt  = trade['exit_time']
-        duration = round((exit_dt - entry_dt).total_seconds() / 60, 1)
+        entry_dt    = trade['entry_time']
+        exit_dt     = trade['exit_time']
+        duration    = round((exit_dt - entry_dt).total_seconds() / 60, 1)
 
         entry_price = trade['entry_price']
         exit_price  = trade['exit_price']
         peak_price  = trade.get('peak_price', exit_price)
+        low_price   = trade.get('low_price', exit_price)   # min option LTP during trade
         entry_vwap  = trade.get('entry_vwap', 0.0)
+        exit_vwap   = trade.get('exit_vwap', 0.0)
         dist_vwap   = trade.get('entry_dist', round(abs(entry_price - entry_vwap), 2))
-        nifty_entry = trade.get('nifty_at_entry', 0.0)
-        nifty_exit  = trade.get('nifty_at_exit', 0.0)
-        nifty_move  = round(nifty_exit - nifty_entry, 2) if nifty_entry > 0 and nifty_exit > 0 else 0.0
+        futs_entry  = trade.get('futures_at_entry', 0.0)
+        futs_exit   = trade.get('futures_at_exit', 0.0)
+        futs_move   = round(futs_exit - futs_entry, 2) if futs_entry > 0 else 0.0
 
         pts_gained  = round(exit_price - entry_price, 2)
         pts_max     = round(peak_price - entry_price, 2)
+        pts_low     = round(low_price  - entry_price, 2)   # worst drawdown
         pts_missed  = round(pts_max - pts_gained, 2)
+        mae         = round(min(pts_low, 0), 2)             # max adverse excursion
         trail_eff   = round(pts_gained / pts_max * 100, 1) if pts_max > 0 else 0.0
+
+        atm         = trade.get('atm_at_entry', 0)
+        strike      = trade.get('strike', 0)
+        itm_depth   = abs(int(atm) - int(strike)) if atm and strike else 0
 
         cap_summary = self.cap_mgr.get_summary()
         deployed    = cap_summary.get('deployed', config.INITIAL_CAPITAL)
         roi_pct     = round(trade['net_rs'] / deployed * 100, 3) if deployed > 0 else 0.0
         cap_after   = cap_summary.get('current', 0)
 
-        exit_reason = trade.get('exit_reason', '')
-        exit_short  = exit_reason.split('|')[0].strip()[:50] if exit_reason else ''
-
-        mode = 'PAPER' if config.PAPER_TRADE else 'LIVE'
+        mode        = 'PAPER' if config.PAPER_TRADE else 'LIVE'
+        session     = trade.get('session', 'NORMAL')
+        sig_type    = trade.get('signal_type', '')
+        vwap_trend  = trade.get('vwap_trend_at_entry', '')
+        sl_pts      = trade.get('sl_pts_used', '')
+        tgt_pts     = trade.get('target_pts_used', '')
+        sl_price    = trade.get('sl_price', '')
+        tgt_price   = trade.get('target_price', '')
+        trail_step  = trade.get('trail_step_reached', '')
+        early_tc    = trade.get('early_trade_count', '')
+        pb_count    = trade.get('pullback_count_at_entry', '')
+        high_vix    = trade.get('high_vix', '')
 
         self._writer.writerow([
             str(self.today),
             len(self.trades),
             mode,
+            session,
             entry_dt.strftime('%H:%M:%S'),
             exit_dt.strftime('%H:%M:%S'),
             duration,
+            sig_type,
             trade['direction'],
             trade['strike'],
             trade.get('expiry', ''),
-            trade.get('atm_at_entry', ''),
+            atm,
+            itm_depth,
             f"{entry_price:.2f}",
             f"{exit_price:.2f}",
             f"{peak_price:.2f}",
-            f"{entry_vwap:.2f}",
-            f"{dist_vwap:.2f}",
-            f"{nifty_entry:.2f}" if nifty_entry else '',
-            f"{nifty_exit:.2f}"  if nifty_exit  else '',
-            f"{nifty_move:.2f}"  if nifty_move  else '',
+            f"{low_price:.2f}",
             f"{pts_gained:+.2f}",
             f"{pts_max:.2f}",
+            f"{pts_low:.2f}",
             f"{pts_missed:.2f}",
+            f"{mae:.2f}",
             f"{trail_eff:.1f}",
+            f"{entry_vwap:.2f}",
+            f"{dist_vwap:.2f}",
+            vwap_trend,
+            f"{exit_vwap:.2f}" if exit_vwap else '',
+            f"{futs_entry:.2f}" if futs_entry else '',
+            f"{futs_exit:.2f}"  if futs_exit  else '',
+            f"{futs_move:.2f}"  if futs_move  else '',
+            sl_pts,
+            tgt_pts,
+            f"{sl_price:.2f}"  if sl_price  else '',
+            f"{tgt_price:.2f}" if tgt_price else '',
+            trail_step,
             f"{trade['pnl_rs']:+.2f}",
             f"{trade['total_cost']:.2f}",
             f"{trade['net_rs']:+.2f}",
             f"{cap_after:,.0f}",
             f"{roi_pct:.3f}",
+            trade.get('exit_reason', ''),
             trade.get('exit_phase', ''),
-            exit_short,
             'Y' if trade.get('breakeven_done') else 'N',
             'Y' if trade.get('trail_active') else 'N',
+            early_tc,
+            pb_count,
             f"{self.vix_at_open:.1f}",
-            f"{trade.get('target_points', 0):.1f}",
-            trade.get('target_reason', ''),
+            'Y' if high_vix else 'N',
         ])
         self._log.flush()
 

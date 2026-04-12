@@ -550,66 +550,217 @@ class OptionManager:
 
     def preload_strikes(self, spot: float):
         """
-        Called ONCE at startup after getting first futures LTP.
-        Resolves tokens and OI for all candidate strikes at multiple
-        ITM depths for both CE and PE.
-        Populates self._strike_cache so pick_strike() is instant.
+        Called ONCE at startup. Caches every strike from ATM±PRELOAD_ITM_MIN
+        to ATM±PRELOAD_ITM_MAX in PRELOAD_STEP increments for both CE and PE.
+
+        This covers market moves up to PRELOAD_ITM_MAX pts from open ATM —
+        so even if Nifty runs 400 pts, we still have ITM options pre-cached.
+
+        OI is fetched in a SINGLE BATCH CALL per direction (not per-token),
+        which is much faster and avoids rate-limiting.
         """
         atm   = round_to_strike(spot, config.STRIKE_STEP)
         sigma = config.IV_PCT / 100.0
         r     = config.RISK_FREE_RATE
         T     = self.dte
 
-        print(f"\n[PreLoad] Starting strike pre-load: spot={spot:.0f} ATM={atm} "
-              f"expiry={self.expiry_str}")
-        print(f"[PreLoad] ITM depths to scan: {config.PRELOAD_ITM_DEPTHS} pts")
+        depths = list(range(config.PRELOAD_ITM_MIN,
+                            config.PRELOAD_ITM_MAX + config.PRELOAD_STEP,
+                            config.PRELOAD_STEP))
 
-        # Build scrip master OI cache once before scanning strikes
-        _build_scrip_oi_cache()
+        print(f"\n[PreLoad] Starting pre-load: spot={spot:.0f} ATM={atm} "
+              f"expiry={self.expiry_str}")
+        print(f"[PreLoad] Caching {len(depths)} ITM depths per direction "
+              f"({depths[0]}–{depths[-1]}pts) = up to {len(depths)*2} strikes total")
 
         for direction in ["CE", "PE"]:
-            entries = []
-
+            # Build continuous strike list from close ITM to deep ITM
             if direction == "CE":
-                strikes = [atm - d for d in config.PRELOAD_ITM_DEPTHS]
-                extra = []
-                for s in strikes:
-                    extra += [s - 50, s, s + 50]
-                strikes = sorted(set(extra))
+                # CE: strikes below ATM (lower strike = more ITM for calls)
+                strikes = sorted([atm - d for d in depths])
             else:
-                strikes = [atm + d for d in config.PRELOAD_ITM_DEPTHS]
-                extra = []
-                for s in strikes:
-                    extra += [s - 50, s, s + 50]
-                strikes = sorted(set(extra), reverse=True)
+                # PE: strikes above ATM (higher strike = more ITM for puts)
+                strikes = sorted([atm + d for d in depths], reverse=True)
 
-            print(f"[PreLoad] {direction}: checking {len(strikes)} candidate strikes...")
-
+            # ── Step 1: Resolve tokens from cached scrip master ──────────
+            token_map: dict[int, str] = {}   # strike → token
+            sym_map:   dict[int, str] = {}   # strike → symbol (for display)
             for strike in strikes:
+                tok = find_option_token(
+                    self.client, "NIFTY", self.expiry_date, strike, direction)
+                if tok:
+                    token_map[strike] = tok
+                    sym_map[strike]   = next(
+                        (row.get("pTrdSymbol", "") for row in _scrip_cache
+                         if row.get("pSymbol", "") == tok), "?")
+                else:
+                    logger.debug(f"[PreLoad] {direction} {strike}: no token in scrip master")
+
+            if not token_map:
+                print(f"[PreLoad] {direction}: no tokens resolved — check expiry format")
+                continue
+
+            print(f"[PreLoad] {direction}: {len(token_map)}/{len(strikes)} tokens resolved "
+                  f"— fetching OI+LTP in batch...")
+
+            # ── Step 2: Batch OI + LTP fetch ────────────────────────────
+            # Kotak Neo v2 ohlc response (confirmed from debug output):
+            #   - Token id field : 'exchange_token'  (NOT 'tk')
+            #   - LTP            : nested inside ohlc['close']  (NOT flat)
+            #   - OI             : NOT present in ohlc at all
+            #
+            # Strategy:
+            #   Pass 1 — quote_type="ohlc"  → get LTP from ohlc['close']
+            #   Pass 2 — quote_type=""       → get OI from full quote response
+            #
+            # Build exchange_token → pSymbol reverse map so we can match records.
+            batch_oi:  dict[str, int]   = {}
+            batch_ltp: dict[str, float] = {}
+
+            all_tokens = list(token_map.values())
+
+            # exchange_token (REST id) → pSymbol (WS subscribe id)
+            extok_to_psym: dict[str, str] = {}
+            for row in _scrip_cache:
+                psym  = str(row.get("pSymbol", "")).strip()
+                extok = str(row.get("pExchSym", "") or
+                            row.get("exchange_token", "") or
+                            row.get("pToken", "")).strip()
+                if psym in all_tokens and extok:
+                    extok_to_psym[extok] = psym
+            # Also map display_symbol → pSymbol as fallback
+            dsym_to_psym: dict[str, str] = {
+                str(row.get("pTrdSymbol", "")).upper(): str(row.get("pSymbol", ""))
+                for row in _scrip_cache
+                if str(row.get("pSymbol", "")) in all_tokens
+            }
+
+            def _resolve_psym(rec: dict) -> str:
+                """Find the pSymbol for a quote record using all known id fields."""
+                # Direct token fields
+                for fld in ("tk", "token", "instrument_token"):
+                    v = str(rec.get(fld, "")).strip()
+                    if v in all_tokens:
+                        return v
+                # exchange_token reverse lookup
+                extok = str(rec.get("exchange_token", "")).strip()
+                if extok in extok_to_psym:
+                    return extok_to_psym[extok]
+                # display_symbol reverse lookup
+                dsym = str(rec.get("display_symbol", "")).upper().strip()
+                if dsym in dsym_to_psym:
+                    return dsym_to_psym[dsym]
+                return ""
+
+            def _extract_ltp(rec: dict) -> float:
+                """Extract LTP — handles both flat and nested ohlc dict."""
+                # Flat fields first
+                for fld in ("ltp", "ltP", "last_price", "lastPrice", "lc"):
+                    v = rec.get(fld)
+                    if v is not None:
+                        try:
+                            fv = float(v)
+                            if fv > 0:
+                                return fv
+                        except (ValueError, TypeError):
+                            pass
+                # Kotak ohlc response: prices nested in ohlc sub-dict
+                ohlc = rec.get("ohlc")
+                if isinstance(ohlc, dict):
+                    for fld in ("close", "ltp", "high", "open"):
+                        v = ohlc.get(fld)
+                        if v is not None:
+                            try:
+                                fv = float(v)
+                                if fv > 0:
+                                    return fv
+                            except (ValueError, TypeError):
+                                pass
+                return 0.0
+
+            def _extract_oi(rec: dict) -> int:
+                """Extract OI — check all known field names."""
+                for fld in ("oi", "open_interest", "openInterest", "OI",
+                            "openInt", "dOpenInt", "openint", "open_int",
+                            "tot_buy_qty", "totBuyQty"):
+                    v = rec.get(fld)
+                    if v is not None:
+                        try:
+                            iv = int(float(v))
+                            if iv > 0:
+                                return iv
+                        except (ValueError, TypeError):
+                            pass
+                return 0
+
+            # Pass 1: ohlc → LTP
+            try:
+                resp = self.client.quotes(
+                    instrument_tokens=[{"instrument_token": t,
+                                        "exchange_segment": config.FO_SEGMENT}
+                                       for t in all_tokens],
+                    quote_type="ohlc",
+                )
+                data = _unwrap_quotes_resp(resp)
+                if data:
+                    print(f"\n[OI_DEBUG] ohlc fields   : {list(data[0].keys())}")
+                    print(f"[OI_DEBUG] ohlc sample   : {dict(list(data[0].items())[:20])}")
+                for rec in (data or []):
+                    psym = _resolve_psym(rec)
+                    if psym:
+                        lv = _extract_ltp(rec)
+                        if lv > 0:
+                            batch_ltp[psym] = lv
+            except Exception as e:
+                logger.debug(f"[PreLoad] ohlc batch: {e}")
+
+            # Pass 2: full quote (quote_type="") → OI + LTP fallback
+            try:
+                resp = self.client.quotes(
+                    instrument_tokens=[{"instrument_token": t,
+                                        "exchange_segment": config.FO_SEGMENT}
+                                       for t in all_tokens],
+                    quote_type="",
+                )
+                data = _unwrap_quotes_resp(resp)
+                if data:
+                    print(f"[OI_DEBUG] full qt fields: {list(data[0].keys())}")
+                    print(f"[OI_DEBUG] full qt sample: {dict(list(data[0].items())[:20])}")
+                for rec in (data or []):
+                    psym = _resolve_psym(rec)
+                    if not psym:
+                        continue
+                    ov = _extract_oi(rec)
+                    if ov > 0:
+                        batch_oi[psym] = ov
+                    if psym not in batch_ltp or batch_ltp[psym] == 0:
+                        lv = _extract_ltp(rec)
+                        if lv > 0:
+                            batch_ltp[psym] = lv
+            except Exception as e:
+                logger.debug(f"[PreLoad] full quote batch: {e}")
+
+            ltp_found = sum(1 for v in batch_ltp.values() if v > 0)
+            oi_found  = sum(1 for v in batch_oi.values()  if v > 0)
+            print(f"[PreLoad] Batch result: LTP={ltp_found}/{len(all_tokens)} "
+                  f"OI={oi_found}/{len(all_tokens)}")
+
+            # ── Step 3: Build cache entries ──────────────────────────────
+            entries = []
+            for strike in strikes:
+                tok   = token_map.get(strike)
+                if not tok:
+                    continue
+
                 delta = _bs_delta(spot, strike, T, r, sigma, direction)
-                if delta < 0.50:
-                    continue
-
-                token = find_option_token(
-                    self.client, "NIFTY", self.expiry_date, strike, direction
-                )
-                if not token:
-                    logger.debug(f"[PreLoad] {direction} {strike}: no token found")
-                    continue
-
-                # Show matched symbol for verification
-                matched_sym = next(
-                    (r.get("pTrdSymbol","") for r in _scrip_cache
-                     if r.get("pSymbol","") == token), "?"
-                )
-
-                # OI from scrip master (instant, no HTTP) + LTP from API
-                oi, ltp = fetch_oi_and_ltp(self.client, token)
+                oi    = batch_oi.get(tok, 0)
+                ltp   = batch_ltp.get(tok, 0.0)
+                sym   = sym_map.get(strike, "?")
 
                 entry = {
                     "strike"     : strike,
-                    "token"      : token,
-                    "delta"      : delta,
+                    "token"      : tok,
+                    "delta"      : round(delta, 4),
                     "oi"         : oi,
                     "ltp"        : ltp,
                     "expiry_str" : self.expiry_str,
@@ -617,21 +768,24 @@ class OptionManager:
                 }
                 entries.append(entry)
 
-                oi_ok = "✅" if oi >= config.MIN_OI else "⚠️ "
-                dl_ok = "✅" if delta >= config.MIN_DELTA else "⚠️ "
-                print(f"[PreLoad]   {direction} {strike}: "
+                oi_ok = "✅" if oi >= config.MIN_OI else ("⚠️ " if oi > 0 else "❌ 0")
+                dl_ok = "✅" if delta >= config.MIN_DELTA else ("⚠️ " if delta >= 0.5 else "  ")
+                print(f"[PreLoad]   {direction} {strike:>6}: "
                       f"delta={delta:.2f}{dl_ok}  OI={oi:>12,}{oi_ok}  "
-                      f"LTP={ltp:.1f}  sym={matched_sym}")
+                      f"LTP={ltp:>7.1f}  {sym}")
 
-                time.sleep(0.05)
-
+            # Sort: best delta first, then OI as tiebreak
             entries.sort(key=lambda x: (x["delta"], x["oi"]), reverse=True)
             self._strike_cache[direction] = entries
-            print(f"[PreLoad] {direction}: {len(entries)} strikes cached ✅")
 
-        print(f"[PreLoad] ✅ Pre-load complete. "
-              f"CE={len(self._strike_cache['CE'])} strikes, "
-              f"PE={len(self._strike_cache['PE'])} strikes cached.\n")
+            good = sum(1 for e in entries
+                       if e["delta"] >= config.MIN_DELTA and e["oi"] >= config.MIN_OI)
+            print(f"[PreLoad] {direction}: {len(entries)} strikes cached "
+                  f"({good} pass delta+OI filter) ✅")
+
+        ce_n = len(self._strike_cache["CE"])
+        pe_n = len(self._strike_cache["PE"])
+        print(f"\n[PreLoad] ✅ Done. CE={ce_n} strikes, PE={pe_n} strikes cached.\n")
 
     def refresh_oi(self):
         """
@@ -648,52 +802,86 @@ class OptionManager:
     def pick_strike(self, spot: float, direction: str) -> dict | None:
         """
         Pick best pre-cached ITM strike for direction at signal time.
-        Fast — reads from _strike_cache, no HTTP calls.
-        Falls back to live scan if cache has nothing passing filters.
+        Re-computes delta at current spot (market may have moved from open ATM).
+
+        OI strategy:
+          - If preload captured OI > 0: filter delta >= MIN_DELTA AND OI >= MIN_OI
+          - If preload OI = 0 (API limitation): filter on delta only, log warning
+            and do a live OI fetch for the chosen strike only (1 API call)
+          - If nothing in cache passes delta: live scan fallback
+
+        Strike ITM check uses delta alone (not ATM position comparison)
+        so it still works correctly after big market moves.
         """
-        atm   = round_to_strike(spot, config.STRIKE_STEP)
         sigma = config.IV_PCT / 100.0
         r     = config.RISK_FREE_RATE
         T     = self.dte
 
         candidates = self._strike_cache.get(direction, [])
 
-        if candidates:
-            # Re-compute delta at current spot (spot may have moved)
-            for c in candidates:
-                c["delta"] = _bs_delta(spot, c["strike"], T, r, sigma, direction)
+        if not candidates:
+            print(f"[Strike] Cache empty for {direction} — live scan")
+            return self._live_scan(spot, direction)
 
-            # Filter: delta >= 0.85, OI >= 12L, strike is still ITM
-            valid = [
-                c for c in candidates
-                if (c["delta"] >= config.MIN_DELTA and
-                    c["oi"] >= config.MIN_OI and
-                    (direction == "CE" and c["strike"] < atm or
-                     direction == "PE" and c["strike"] > atm))
-            ]
+        # Re-compute delta at current spot for every cached entry
+        for c in candidates:
+            c["delta"] = round(_bs_delta(spot, c["strike"], T, r, sigma, direction), 4)
 
+        # Sort by delta descending (highest delta = most ITM = most reliable)
+        candidates.sort(key=lambda x: x["delta"], reverse=True)
+
+        # Check if any cached entries have OI data
+        any_oi = any(c["oi"] > 0 for c in candidates)
+
+        if any_oi:
+            # ── Full filter: delta + OI ──────────────────────
+            valid = [c for c in candidates
+                     if c["delta"] >= config.MIN_DELTA and c["oi"] >= config.MIN_OI]
             if valid:
-                # Pick highest delta (most ITM that passes both filters)
                 best = valid[0]
-                print(f"[Strike] ✅ Cache hit — {direction} {best['strike']} "
+                print(f"[Strike] ✅ {direction} {best['strike']} "
                       f"delta={best['delta']:.2f} OI={best['oi']:,}")
                 return best
 
-            # Try relaxed: any passing delta, ignore OI
-            relaxed = [
-                c for c in candidates
-                if c["delta"] >= config.MIN_DELTA and
-                (direction == "CE" and c["strike"] < atm or
-                 direction == "PE" and c["strike"] > atm)
-            ]
-            if relaxed:
-                best = relaxed[0]
-                print(f"[Strike] ⚠️  Cache OI-relaxed — {direction} {best['strike']} "
-                      f"delta={best['delta']:.2f} OI={best['oi']:,}")
+            # OI filter too strict — try delta only
+            delta_ok = [c for c in candidates if c["delta"] >= config.MIN_DELTA]
+            if delta_ok:
+                best = delta_ok[0]
+                print(f"[Strike] ⚠️  {direction} {best['strike']} OI below threshold "
+                      f"delta={best['delta']:.2f} OI={best['oi']:,} — using anyway")
                 return best
 
-        # Live fallback (cache miss or all strikes now OTM)
-        print(f"[Strike] Cache miss for {direction} — running live scan...")
+        else:
+            # ── OI came back 0 from preload (API limitation) ─
+            # Filter on delta only, then do ONE live OI fetch for top candidate
+            delta_ok = [c for c in candidates if c["delta"] >= config.MIN_DELTA]
+            if delta_ok:
+                # Fetch OI live for the top few candidates to find one with good OI
+                print(f"[Strike] OI=0 in cache — fetching live OI for top candidates...")
+                for candidate in delta_ok[:5]:  # check top 5 delta-wise
+                    tok = candidate["token"]
+                    live_oi, live_ltp = fetch_oi_and_ltp(self.client, tok)
+                    candidate["oi"]  = live_oi
+                    if live_ltp > 0:
+                        candidate["ltp"] = live_ltp
+                    oi_tag = f"OI={live_oi:,}" if live_oi > 0 else "OI=? (API no data)"
+                    print(f"[Strike]   {direction} {candidate['strike']}: "
+                          f"delta={candidate['delta']:.2f}  {oi_tag}  LTP={live_ltp:.1f}")
+                    if live_oi >= config.MIN_OI:
+                        print(f"[Strike] ✅ {direction} {candidate['strike']} "
+                              f"delta={candidate['delta']:.2f} OI={live_oi:,}")
+                        return candidate
+
+                # Nothing passed OI — use highest delta anyway (OI unknown/low)
+                best = delta_ok[0]
+                print(f"[Strike] ⚠️  {direction} {best['strike']} using best delta "
+                      f"(OI API returned 0 — check OI_DEBUG log above) "
+                      f"delta={best['delta']:.2f}")
+                return best
+
+        # Nothing in cache passes delta — live scan
+        print(f"[Strike] No cached strike passes delta for {direction} "
+              f"(market moved?) — live scan")
         return self._live_scan(spot, direction)
 
     def _live_scan(self, spot: float, direction: str) -> dict | None:

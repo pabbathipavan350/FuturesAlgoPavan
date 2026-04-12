@@ -49,29 +49,71 @@ INITIAL_CAPITAL     = TOTAL_CAPITAL
 VIX_HIGH_THRESHOLD  = 15.0    # VIX > 15 = high volatility
 
 # ── SL and Target (VIX-based) ─────────────────────────────
-SL_PTS_HIGH_VIX     = 15.0    # High VIX SL
-TARGET_PTS_HIGH_VIX = 50.0    # High VIX target
-SL_PTS_LOW_VIX      = 10.0    # Low VIX SL
-TARGET_PTS_LOW_VIX  = 35.0    # Low VIX target
+# ── Early session (9:16–9:39) ────────────────────────────
+EARLY_SESSION_END       = "09:40"   # before this = early session rules
+EARLY_SESSION_MAX_TRADES= 2         # max 2 trades in early session
+EARLY_SL_PTS            = 7.0       # tight SL in early session
+EARLY_TRAIL_1_TRIGGER   = 25.0      # +25 → SL = entry + 5
+EARLY_TRAIL_1_LOCK      = 5.0
+EARLY_TRAIL_2_TRIGGER   = 35.0      # +35 → SL = entry + 25
+EARLY_TRAIL_2_LOCK      = 25.0
+EARLY_TARGET_PTS        = 45.0      # book profit at +45
+EARLY_LOSS_WAIT_MINS    = 10        # after a losing trade, wait 10 min before 2nd
+
+# ── Normal session (9:40 onward) ─────────────────────────
+SL_PTS_HIGH_VIX         = 15.0      # kept for VIX reference but overridden below
+TARGET_PTS_HIGH_VIX     = 50.0
+SL_PTS_LOW_VIX          = 10.0
+TARGET_PTS_LOW_VIX      = 35.0
+
+NORMAL_SL_PTS           = 15.0      # fixed SL for normal session
+NORMAL_TARGET_PTS       = 50.0      # target
+# Trail ladder (profit_pts → new SL offset from entry)
+NORMAL_TRAIL_1_TRIGGER  = 20.0      # +20 → breakeven (entry + 1)
+NORMAL_TRAIL_1_LOCK     = 1.0
+NORMAL_TRAIL_2_TRIGGER  = 30.0      # +30 → entry + 10
+NORMAL_TRAIL_2_LOCK     = 10.0
+NORMAL_TRAIL_3_TRIGGER  = 35.0      # +35 → entry + 20
+NORMAL_TRAIL_3_LOCK     = 20.0
+NORMAL_TRAIL_4_TRIGGER  = 40.0      # +40 → entry + 25
+NORMAL_TRAIL_4_LOCK     = 25.0
+NORMAL_TRAIL_STEP_START = 45.0      # from +45 trail every 5 pts
+NORMAL_TRAIL_STEP_SIZE  = 5.0       # step size for continuous trail
 
 # ── Trailing SL ───────────────────────────────────────────
 # Step 1: +20 pts → SL moves to entry (breakeven)
 # Step 2: +30 pts → SL moves to entry + 10 (locked)
 # SL only ever moves UP — never down.
-TRAIL_BREAKEVEN_TRIGGER = 20.0   # +20 pts -> SL = entry price (breakeven)
-TRAIL_LOCK_TRIGGER      = 30.0   # +30 pts -> SL = entry + TRAIL_LOCK_PTS
-TRAIL_LOCK_PTS          = 10.0   # locked profit at step 2
+# Legacy aliases kept so nothing else breaks
+TRAIL_BREAKEVEN_TRIGGER = 20.0
+TRAIL_LOCK_TRIGGER      = 30.0
+TRAIL_LOCK_PTS          = 10.0
 
 # ── VWAP source ───────────────────────────────────────────
 VWAP_MIN_TICKS          = 3      # min futures ticks before trusting signals
+CROSS_CONFIRM_TICKS     = 3      # ticks price must stay on new side to confirm a cross
+                                  # prevents single-tick fake crosses from firing signals
 
 # ── Entry proximity filters ───────────────────────────────
-# Fresh cross: enter only if futures is within ±10 pts of VWAP
-FRESH_CROSS_MAX_DIST    = 5.0    # fire if within 5pts of VWAP at cross
+# Fresh cross: enter only if futures is within ±2 pts of VWAP
+FRESH_CROSS_MAX_DIST    = 2.0    # fire if within 2pts of VWAP at cross
 
-# Pullback: enter when futures is within 10–15 pts of VWAP
-PULLBACK_MAX_DIST       = 5.0    # pullback zone: 0 to 5pts from VWAP
+# Pullback: enter when futures is within 0–2 pts of VWAP
+PULLBACK_MAX_DIST       = 2.0    # pullback zone: 0 to 2pts from VWAP
 PULLBACK_MIN_DIST       = 0.0    # min distance from VWAP (0 = at VWAP)
+
+# ── VWAP trend filter ──────────────────────────────────────
+# CE trades only when VWAP is rising; PE trades only when VWAP is falling.
+# Tracks one VWAP snapshot per completed minute (at the turn of each minute).
+# Compares the latest snapshot against VWAP_TREND_LOOKBACK minutes ago.
+# Tracking starts from first tick (even pre-9:30) but the filter is only
+# APPLIED to entry decisions after 9:30 AM.
+VWAP_TREND_LOOKBACK     = 5      # compare last N minute-snapshots for trend
+VWAP_TREND_MIN_CHANGE   = 0.5    # minimum change (pts/min window) = trending
+VWAP_TREND_START        = "09:30"  # apply filter only from this time onward
+
+# ── Pullback trade limit per direction ────────────────────
+MAX_PULLBACK_PER_DIR    = 2      # max pullback entries per direction per day
 
 # ── Confirmation filter (mid-trade cross check) ───────────
 # When already in a trade and futures crosses VWAP again:
@@ -94,7 +136,12 @@ MAX_DAILY_LOSS_RS       = -15000 # stop if net day loss > Rs 15,000
 # ── Strike pre-loading ────────────────────────────────────
 # At startup, we resolve tokens for several ITM depths for both CE and PE.
 # When a signal fires, we pick from this cache — zero HTTP delay.
-PRELOAD_ITM_DEPTHS      = [100, 150, 200, 250, 300]  # pts ITM to pre-cache
+# Continuous ITM range: cache every strike from ATM-50 to ATM-500 (CE)
+# and ATM+50 to ATM+500 (PE) in 50pt steps = 10 strikes per direction.
+# Covers market moving up to 500pts from open ATM without needing live scan.
+PRELOAD_ITM_MIN         = 50      # closest ITM strike to cache (pts from ATM)
+PRELOAD_ITM_MAX         = 500     # deepest ITM strike to cache (pts from ATM)
+PRELOAD_STEP            = 50      # step size (= STRIKE_STEP)
 
 # ── Strike selection (runtime fallback) ───────────────────
 MIN_DELTA           = 0.80
