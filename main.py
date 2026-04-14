@@ -141,6 +141,16 @@ class FuturesVWAPAlgo:
         self._preloaded         = False
         self._first_futures_ltp = 0.0
 
+        # Reconnect guard — prevents multiple threads racing on the same drop
+        self._reconnecting      = False
+        self._reconnect_lock    = threading.Lock()
+
+        # Pre-subscribed option WS tracking
+        # Subscribed at startup so live LTP is available the moment a signal fires.
+        # {direction: token}  e.g. {"CE": "54321", "PE": "98765"}
+        self._pre_subscribed: dict[str, str]   = {}
+        self._pre_ltp:        dict[str, float] = {}  # direction → live WS LTP
+
         # Auto-shutdown timer (set properly in initialize())
         self._start_time    = now_ist()
         self._shutdown_time = self._start_time + datetime.timedelta(hours=5, minutes=50)
@@ -228,6 +238,7 @@ class FuturesVWAPAlgo:
         try:
             self.opt_mgr.preload_strikes(spot)
             self._preloaded = True
+            self._subscribe_preloaded_options()   # ← subscribe top CE+PE for live LTP
             print("[PreLoad] ✅ Startup pre-load done — ready before 9:15")
         except Exception as e:
             self.logger.error(f"[PreLoad] Startup error: {e}", exc_info=True)
@@ -327,39 +338,95 @@ class FuturesVWAPAlgo:
 
     def _on_ws_open(self, *args):
         print("[WS] Connected")
+        # Always resubscribe on open — handles both first connect AND SDK-internal
+        # reconnects (the SDK calls on_open after every successful reconnect, but
+        # it does NOT restore subscriptions — we must do it ourselves).
+        threading.Thread(target=self._resubscribe_all,
+                         daemon=True, name="WSSub").start()
+
+    def _resubscribe_all(self):
+        """Resubscribe futures + pre-loaded options + active option after any connect/reconnect."""
+        time.sleep(0.5)   # tiny settle delay — SDK needs a moment before accepting subscribe calls
+        self._subscribe_futures()
+        for d, pre_tok in self._pre_subscribed.items():
+            try:
+                self.client.subscribe(
+                    instrument_tokens=[{"instrument_token": pre_tok,
+                                        "exchange_segment": config.FO_SEGMENT}],
+                    isIndex=False, isDepth=False,
+                )
+                self.logger.debug(f"[WS] Re-subscribed pre-loaded {d} token={pre_tok}")
+            except Exception as e:
+                self.logger.debug(f"[WS] Re-sub pre-loaded {d} error: {e}")
+        if self.option_token:
+            try:
+                self._subscribe_option(self.option_token)
+            except Exception as e:
+                self.logger.debug(f"[WS] Re-sub active option error: {e}")
 
     def _on_ws_error(self, error):
-        self.logger.error(f"[WS] Error: {error}")
+        err_str = str(error)
+        # "already closed" / "socket is already closed" — expected noise during
+        # close storms (Kotak drops all connections near market close).
+        # Log as debug only to avoid spamming the console.
+        if "already closed" in err_str.lower() or "nonetype" in err_str.lower():
+            self.logger.debug(f"[WS] Error (expected during close): {error}")
+        else:
+            self.logger.error(f"[WS] Error: {error}")
 
     def _on_ws_close(self, *args):
+        # Kotak drops all connections near market close — this fires many times.
+        # After 15:00 there is nothing more to trade, so just log quietly and exit.
+        now_t = now_ist().time()
+        if now_t >= datetime.time(15, 0):
+            self.logger.debug("[WS] Closed after 15:00 — no reconnect needed")
+            return
         self.logger.warning("[WS] Closed")
-        if self._running:
-            threading.Thread(target=self._ws_reconnect_loop,
-                             daemon=True, name="WSReconnect").start()
+        if not self._running:
+            return
+        with self._reconnect_lock:
+            if self._reconnecting:
+                self.logger.debug("[WS] Close event ignored — reconnect already in progress")
+                return
+            self._reconnecting = True
+        # Small delay so the SDK's own reconnect attempt can settle first,
+        # preventing our loop and the SDK's loop from fighting each other.
+        threading.Thread(target=self._ws_reconnect_loop,
+                         daemon=True, name="WSReconnect").start()
 
     def _ws_reconnect_loop(self):
         """
-        Auto-reconnect on WS drop (WinError 10060 / network blip).
-        Retries with backoff: 5s → 10s → 20s → 30s (cap).
+        Our fallback reconnect — only runs if the SDK's internal reconnect also fails.
+        The SDK's own reconnect calls on_open which triggers _resubscribe_all,
+        so we do NOT need to subscribe tokens here — just re-establish the connection.
+        Only ONE instance of this runs at a time — guarded by _reconnect_lock.
         """
         delays = [5, 10, 20, 30]
-        for attempt, delay in enumerate(delays, 1):
-            if not self._running:
-                return
-            print(f"\n[WS] Reconnect attempt {attempt}/{len(delays)} in {delay}s...")
-            time.sleep(delay)
-            if not self._running:
-                return
-            try:
-                self._setup_websocket()
-                self._subscribe_futures()
-                if self.option_token:
-                    self._subscribe_option(self.option_token)
-                print(f"[WS] ✅ Reconnected (attempt {attempt})")
-                return
-            except Exception as e:
-                self.logger.error(f"[WS] Reconnect attempt {attempt} failed: {e}")
-        print("[WS] ❌ All reconnect attempts failed — session manager will handle")
+        try:
+            for attempt, delay in enumerate(delays, 1):
+                if not self._running:
+                    return
+                # Check again — market may have closed while we were waiting
+                if now_ist().time() >= datetime.time(15, 0):
+                    print("[WS] Reconnect aborted — after 15:00, no more trading")
+                    return
+                print(f"\n[WS] Reconnect attempt {attempt}/{len(delays)} in {delay}s...")
+                time.sleep(delay)
+                if not self._running:
+                    return
+                try:
+                    self._setup_websocket()
+                    # Subscriptions are handled by _on_ws_open → _resubscribe_all
+                    # Just call subscribe_futures to trigger the open event
+                    self._subscribe_futures()
+                    print(f"[WS] ✅ Reconnected (attempt {attempt})")
+                    return
+                except Exception as e:
+                    self.logger.error(f"[WS] Reconnect attempt {attempt} failed: {e}")
+            print("[WS] ❌ All reconnect attempts failed — session manager will handle")
+        finally:
+            with self._reconnect_lock:
+                self._reconnecting = False
 
     def _subscribe_futures(self):
         if not self.futures_token:
@@ -416,6 +483,13 @@ class FuturesVWAPAlgo:
                     continue
                 self._last_tick_time  = now_ist()
                 self._circuit_alerted = False
+
+                # Track live LTP for pre-subscribed option tokens
+                # (before any trade is open — keeps LTP fresh for order pricing)
+                for _d, _pre_tok in self._pre_subscribed.items():
+                    if token == str(_pre_tok):
+                        self._pre_ltp[_d] = ltp
+                        break
 
                 if token == str(self.futures_token):
                     self._on_futures_tick(tick)
@@ -547,6 +621,35 @@ class FuturesVWAPAlgo:
             reason = "Trail SL" if self.trail_active else "SL"
             self.logger.info(f"[Exit] {reason} ltp={ltp:.2f} sl={self.sl_price:.2f}")
             self._exit_trade(ltp, reason)
+
+    # ── Pre-subscribed options ────────────────────────────
+
+    def _subscribe_preloaded_options(self):
+        """
+        Subscribe the best CE and PE tokens immediately after preload.
+        This means live LTP arrives via WebSocket BEFORE any signal fires,
+        so we never need to use the stale cached LTP for order pricing.
+        Called once at startup right after preload_strikes() completes.
+        """
+        for direction in ["CE", "PE"]:
+            candidates = self.opt_mgr._strike_cache.get(direction, [])
+            if not candidates:
+                print(f"[PreSub] ⚠️  No {direction} candidates in cache — skipping")
+                continue
+            best = candidates[0]   # already sorted best-delta first
+            tok  = best["token"]
+            self._pre_subscribed[direction] = tok
+            self._pre_ltp[direction]        = best.get("ltp", 0.0)   # seed with cached value
+            try:
+                self.client.subscribe(
+                    instrument_tokens=[{"instrument_token": tok,
+                                        "exchange_segment": config.FO_SEGMENT}],
+                    isIndex=False, isDepth=False,
+                )
+                print(f"[PreSub] ✅ Subscribed {direction} {best['strike']} "
+                      f"token={tok}  (seeded LTP={best.get('ltp', 0.0):.1f})")
+            except Exception as e:
+                self.logger.error(f"[PreSub] {direction} subscribe error: {e}")
 
     # ── Pre-load trigger ─────────────────────────────────
 
@@ -697,12 +800,27 @@ class FuturesVWAPAlgo:
             return
 
         # ── Get fresh LTP for order pricing ──────────────
-        # Use cached LTP first; fall back to live fetch
-        option_ltp = info.get("ltp") or 0.0
+        # Priority 1: pre-subscribed WS feed — live LTP, zero REST latency
+        # Priority 2: live REST fetch — for any strike that differs from pre-sub
+        # Priority 3: NEVER use cached preload LTP — it may be many hours stale
+        option_ltp = 0.0
+
+        # Check if picked strike matches a pre-subscribed token
+        for d, pre_tok in self._pre_subscribed.items():
+            if info["token"] == pre_tok and d == direction:
+                ws_ltp = self._pre_ltp.get(d, 0.0)
+                if ws_ltp > 0:
+                    option_ltp = ws_ltp
+                    print(f"[LTP] Using pre-subscribed WS LTP: {option_ltp:.2f}")
+                break
+
+        # Fall back to live REST if WS LTP not available
         if option_ltp <= 0:
+            print(f"[LTP] Fetching live LTP via REST for {direction} {info['strike']}...")
             option_ltp = fetch_ltp(self.client, info["token"])
+
         if option_ltp <= 0:
-            self.logger.error("Option LTP unavailable")
+            self.logger.error(f"[LTP] Cannot get option LTP for {direction} {info['strike']} — aborting entry")
             return
 
         print(f"[Strike] {direction} {info['strike']}  "
@@ -922,9 +1040,7 @@ class FuturesVWAPAlgo:
         self.opt_mgr.client = new_client
         self._setup_websocket()
         time.sleep(2)
-        self._subscribe_futures()
-        if self.option_token:
-            self._subscribe_option(self.option_token)
+        self._resubscribe_all()
 
     def _square_off_all(self):
         if self.in_trade:

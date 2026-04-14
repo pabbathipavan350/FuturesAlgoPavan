@@ -54,7 +54,11 @@ def _get_scrip_master(client) -> list:
 
 def _bs_delta(S, K, T, r, sigma, option_type):
     if T <= 0 or sigma <= 0:
-        return 1.0 if (option_type == 'CE' and S > K) else 0.0
+        # Expiry-day boundary: use intrinsic value only
+        if option_type == 'CE':
+            return 1.0 if S > K else 0.0
+        else:  # PE
+            return 1.0 if S < K else 0.0
     try:
         d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
         from statistics import NormalDist
@@ -65,7 +69,16 @@ def _bs_delta(S, K, T, r, sigma, option_type):
 
 def _days_to_expiry(expiry_date: datetime.date) -> float:
     days = (expiry_date - datetime.date.today()).days
-    return max(days, 0) / 365.0
+    if days < 0:
+        return 0.0
+    if days == 0:
+        # Expiry day: use remaining trading time so BS formula works correctly
+        # This prevents T=0 which breaks delta calculation for PEs
+        now = datetime.datetime.now()
+        market_close = datetime.datetime(now.year, now.month, now.day, 15, 30)
+        secs_left = max((market_close - now).total_seconds(), 900)  # min 15 min
+        return secs_left / (365 * 24 * 3600)
+    return days / 365.0
 
 def round_to_strike(price: float, step: int = 50) -> int:
     return int(round(price / step) * step)
@@ -830,6 +843,19 @@ class OptionManager:
         # Sort by delta descending (highest delta = most ITM = most reliable)
         candidates.sort(key=lambda x: x["delta"], reverse=True)
 
+        # ── ITM depth cap: never go deeper than MAX_ITM_DEPTH_PTS from spot ──
+        if direction == "CE":
+            candidates = [c for c in candidates
+                          if (spot - c["strike"]) <= config.MAX_ITM_DEPTH_PTS]
+        else:
+            candidates = [c for c in candidates
+                          if (c["strike"] - spot) <= config.MAX_ITM_DEPTH_PTS]
+
+        if not candidates:
+            print(f"[Strike] All cached strikes deeper than {config.MAX_ITM_DEPTH_PTS}pts "
+                  f"from spot {spot:.0f} — live scan")
+            return self._live_scan(spot, direction)
+
         # Check if any cached entries have OI data
         any_oi = any(c["oi"] > 0 for c in candidates)
 
@@ -879,7 +905,17 @@ class OptionManager:
                       f"delta={best['delta']:.2f}")
                 return best
 
-        # Nothing in cache passes delta — live scan
+        # ── Guaranteed fallback: best available ITM candidate ─────────────
+        # Never return None from cache — always trade something sensible.
+        # Pick highest delta >= 0.50 (at least somewhat ITM).
+        all_itm = [c for c in candidates if c["delta"] >= 0.50]
+        if all_itm:
+            best = all_itm[0]
+            print(f"[Strike] ⚠️  Fallback {direction} {best['strike']} "
+                  f"delta={best['delta']:.2f} OI={best['oi']:,} — best available ITM")
+            return best
+
+        # Absolutely nothing in cache — live scan as last resort
         print(f"[Strike] No cached strike passes delta for {direction} "
               f"(market moved?) — live scan")
         return self._live_scan(spot, direction)

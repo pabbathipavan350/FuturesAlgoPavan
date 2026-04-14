@@ -108,9 +108,9 @@ PULLBACK_MIN_DIST       = 0.0    # min distance from VWAP (0 = at VWAP)
 # Compares the latest snapshot against VWAP_TREND_LOOKBACK minutes ago.
 # Tracking starts from first tick (even pre-9:30) but the filter is only
 # APPLIED to entry decisions after 9:30 AM.
-VWAP_TREND_LOOKBACK     = 5      # compare last N minute-snapshots for trend
+VWAP_TREND_LOOKBACK     = 3      # compare last N minute-snapshots for trend
 VWAP_TREND_MIN_CHANGE   = 0.5    # minimum change (pts/min window) = trending
-VWAP_TREND_START        = "09:30"  # apply filter only from this time onward
+VWAP_TREND_START        = "09:16"  # apply filter from entry-open (was 09:30)
 
 # ── Pullback trade limit per direction ────────────────────
 MAX_PULLBACK_PER_DIR    = 2      # max pullback entries per direction per day
@@ -148,6 +148,7 @@ MIN_DELTA           = 0.80
 MIN_OI              = 1200000
 STRIKE_STEP         = 50
 MAX_OI_WALK_STEPS   = 8
+MAX_ITM_DEPTH_PTS   = 350    # never trade option deeper than 350 pts ITM
 IV_PCT              = 12.0
 RISK_FREE_RATE      = 0.065
 
