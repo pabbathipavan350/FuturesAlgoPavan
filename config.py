@@ -6,7 +6,7 @@
 # Buy PE  : futures crosses below VWAP → buy ITM PE
 # SL/TGT  : VIX-based (high VIX: SL=15 TGT=50 | low VIX: SL=10 TGT=35)
 # Trail   : always active — SL ratchets up once +20 pts in profit
-# Capital : Rs 5,00,000 · 5 lots fixed
+# Capital : Rs 30,000 · 1 lot
 # ============================================================
 
 import os
@@ -40,8 +40,8 @@ KOTAK_MPIN            = os.getenv("KOTAK_MPIN",            "")
 KOTAK_ENVIRONMENT     = os.getenv("KOTAK_ENVIRONMENT",     "prod")
 
 # ── Capital & Position Sizing ─────────────────────────────
-TOTAL_CAPITAL       = 500000   # Rs 5,00,000 deployed
-LOTS                = 5        # Fixed 5 lots always
+TOTAL_CAPITAL       = 30000    # Rs 30,000 deployed
+LOTS                = 1        # 1 lot for Rs30k capital (65 qty × 1 lot)
 LOT_SIZE            = 65       # Nifty lot size
 INITIAL_CAPITAL     = TOTAL_CAPITAL
 
@@ -50,7 +50,7 @@ VIX_HIGH_THRESHOLD  = 15.0    # VIX > 15 = high volatility
 
 # ── SL and Target (VIX-based) ─────────────────────────────
 # ── Early session (9:16–9:39) ────────────────────────────
-EARLY_SESSION_END       = "09:40"   # before this = early session rules
+EARLY_SESSION_END       = "09:30"   # set same as entry start — early session disabled
 EARLY_SESSION_MAX_TRADES= 2         # max 2 trades in early session
 EARLY_SL_PTS            = 7.0       # tight SL in early session
 EARLY_TRAIL_1_TRIGGER   = 25.0      # +25 → SL = entry + 5
@@ -110,7 +110,35 @@ PULLBACK_MIN_DIST       = 0.0    # min distance from VWAP (0 = at VWAP)
 # APPLIED to entry decisions after 9:30 AM.
 VWAP_TREND_LOOKBACK     = 3      # compare last N minute-snapshots for trend
 VWAP_TREND_MIN_CHANGE   = 0.5    # minimum change (pts/min window) = trending
-VWAP_TREND_START        = "09:16"  # apply filter from entry-open (was 09:30)
+VWAP_TREND_START        = "09:30"  # apply filter from entry-open
+
+# ── 4-Scenario VWAP Strategy (vwap_strategy_engine.py) ────
+# Scenario 1/2/3 — Trending VWAP pullback
+SCENARIO_TREND_MIN_CHANGE_PTS   = 20.0  # VWAP must move ≥20pts over lookback to be "trending"
+SCENARIO_PULLBACK_EXTEND_MIN    = 40.0  # price must have gone ≥40pts from VWAP before pullback
+SCENARIO_PULLBACK_EXTEND_MAX    = 60.0  # price should not exceed 60pts from VWAP (overextended)
+SCENARIO_ENTRY_ZONE_PTS         = 5.0   # price must be within VWAP ± 5 for entry
+SCENARIO_TREND_SL_PTS           = 10.0  # stoploss: 10 pts (as per your strategy)
+SCENARIO_TREND_TARGET_PTS       = 40.0  # target: 40 pts with trailing
+SCENARIO_TREND_TRAIL_TRIGGER    = 20.0  # start trailing at +20pts profit
+SCENARIO_TREND_TRAIL_STEP       = 10.0  # trail every 10pts thereafter
+
+# Scenario 4 — Flat VWAP
+SCENARIO_FLAT_MAX_CHANGE        = 5.0   # VWAP change ≤5pts over lookback = flat
+SCENARIO_FLAT_LOOKBACK_MINS     = 15    # flat check lookback in minutes
+SCENARIO_FLAT_PULLBACK_EXTEND   = 40.0  # price must have moved ≥40pts before flat pullback
+SCENARIO_FLAT_TARGET_PTS        = 25.0  # reduced target for flat: 25pts
+SCENARIO_FLAT_SL_PTS            = 10.0  # stoploss same: 10pts
+
+# Scenario 3 — Trend flip confirmation
+SCENARIO_FLIP_CONFIRM_MINS      = 5     # hold new trend direction for 5 mins to confirm flip
+
+# Option entry confirmation zone
+SCENARIO_OPTION_ENTRY_ZONE_PTS  = 5.0   # ITM option must be within ±5 of option VWAP at entry
+
+# Index VWAP gap threshold — if futures and index VWAP diverge by this much,
+# switch to using index VWAP for entry decisions (avoids futures roll gap issues)
+INDEX_VWAP_FUTURES_GAP_THRESHOLD = 20.0
 
 # ── Pullback trade limit per direction ────────────────────
 MAX_PULLBACK_PER_DIR    = 2      # max pullback entries per direction per day
@@ -131,7 +159,7 @@ FATIGUE_MIN_PROFIT_PTS      = 10.0   # "profitable" = exit with >= 10 pts gain
 
 # ── Daily guards ──────────────────────────────────────────
 MAX_CONSEC_SL           = 3      # stop after 3 consecutive SL hits
-MAX_DAILY_LOSS_RS       = -15000 # stop if net day loss > Rs 15,000
+MAX_DAILY_LOSS_RS       = -3000  # stop if net day loss > Rs 3,000 (10% of 30k)
 
 # ── Strike pre-loading ────────────────────────────────────
 # At startup, we resolve tokens for several ITM depths for both CE and PE.
@@ -140,6 +168,7 @@ MAX_DAILY_LOSS_RS       = -15000 # stop if net day loss > Rs 15,000
 # and ATM+50 to ATM+500 (PE) in 50pt steps = 10 strikes per direction.
 # Covers market moving up to 500pts from open ATM without needing live scan.
 PRELOAD_ITM_MIN         = 50      # closest ITM strike to cache (pts from ATM)
+PREFERRED_ITM_DEPTHS    = [100, 150] # always prefer 100 or 150 pts ITM (best OI usually here)
 PRELOAD_ITM_MAX         = 500     # deepest ITM strike to cache (pts from ATM)
 PRELOAD_STEP            = 50      # step size (= STRIKE_STEP)
 
@@ -162,8 +191,8 @@ ENABLE_AMO_OUTSIDE_HOURS = True
 
 # ── Session timing ────────────────────────────────────────
 MARKET_OPEN         = "09:15"
-ENTRY_START         = "09:15"
-SQUARE_OFF_TIME     = "15:25"
+ENTRY_START         = "09:30"
+SQUARE_OFF_TIME     = "15:20"
 EXPIRY_DAY_CUTOFF   = "14:30"
 
 # ── Costs ─────────────────────────────────────────────────
