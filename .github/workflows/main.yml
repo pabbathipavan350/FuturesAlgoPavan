@@ -1,11 +1,7 @@
 name: run-algo
 
 on:
-  # Auto-run Mon-Fri at 9:07 AM IST (3:37 AM UTC)
-  schedule:
-    - cron: '37 3 * * 1-5'
-
-  # Manual trigger from Actions tab anytime
+  # Manual trigger only from Actions tab
   workflow_dispatch:
 
 jobs:
@@ -45,7 +41,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Restore capital.json from previous run
       - name: Restore capital state
         uses: actions/cache@v4
         with:
@@ -54,16 +49,13 @@ jobs:
           restore-keys: |
             capital-state-
 
-      # Prepare folders
       - name: Prepare output folders
         run: mkdir -p logs reports
 
-      # Run algo
       - name: Run algo
         run: python main.py
         continue-on-error: true
 
-      # Always flush logs even if algo crashes
       - name: Flush logs
         if: always()
         run: |
@@ -72,7 +64,6 @@ jobs:
           echo "--- files saved ---" >> logs/workflow.log
           ls -lh logs/ reports/ 2>/dev/null >> logs/workflow.log || true
 
-      # Upload logs/reports
       - name: Upload logs and reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -85,7 +76,6 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
-      # Save updated capital.json for next run
       - name: Save capital state
         if: always()
         uses: actions/cache/save@v4
