@@ -815,19 +815,20 @@ class OptionManager:
     def pick_strike(self, spot: float, direction: str) -> dict | None:
         """
         Pick best pre-cached ITM strike for direction at signal time.
+        Re-computes delta at current spot (market may have moved from open ATM).
 
-        PREFERRED DEPTH RULE (user requirement):
-          Always prefer 100 pts ITM or 150 pts ITM — whichever has the higher OI.
-          These depths give the best balance of delta and liquidity.
-          Falls back to nearest available ITM depth if neither 100/150 is cached.
+        OI strategy:
+          - If preload captured OI > 0: filter delta >= MIN_DELTA AND OI >= MIN_OI
+          - If preload OI = 0 (API limitation): filter on delta only, log warning
+            and do a live OI fetch for the chosen strike only (1 API call)
+          - If nothing in cache passes delta: live scan fallback
 
-        OI fallback:
-          If OI=0 in cache (API limitation): fetch live OI for 100 & 150 candidates only.
+        Strike ITM check uses delta alone (not ATM position comparison)
+        so it still works correctly after big market moves.
         """
         sigma = config.IV_PCT / 100.0
         r     = config.RISK_FREE_RATE
         T     = self.dte
-        atm   = round_to_strike(spot, config.STRIKE_STEP)
 
         candidates = self._strike_cache.get(direction, [])
 
@@ -839,72 +840,82 @@ class OptionManager:
         for c in candidates:
             c["delta"] = round(_bs_delta(spot, c["strike"], T, r, sigma, direction), 4)
 
-        # ── PREFERRED: 100 and 150 pts ITM from current spot ─────────────
-        preferred_depths = getattr(config, "PREFERRED_ITM_DEPTHS", [100, 150])
-        preferred = []
-        for depth in preferred_depths:
-            if direction == "CE":
-                target_strike = round_to_strike(spot - depth, config.STRIKE_STEP)
-            else:
-                target_strike = round_to_strike(spot + depth, config.STRIKE_STEP)
-            # Find this strike in candidates (allow ±STRIKE_STEP tolerance)
-            for c in candidates:
-                if abs(c["strike"] - target_strike) <= config.STRIKE_STEP:
-                    preferred.append(c)
-                    break
+        # Sort by delta descending (highest delta = most ITM = most reliable)
+        candidates.sort(key=lambda x: x["delta"], reverse=True)
 
-        print(f"[Strike] Preferred ITM candidates ({preferred_depths}pts ITM from spot {spot:.0f}):")
-        for c in preferred:
-            depth_actual = abs(spot - c["strike"])
-            print(f"[Strike]   {direction} {c['strike']} depth={depth_actual:.0f}pts "
-                  f"delta={c['delta']:.2f} OI={c['oi']:,}")
+        # ── ITM depth cap: never go deeper than MAX_ITM_DEPTH_PTS from spot ──
+        if direction == "CE":
+            candidates = [c for c in candidates
+                          if (spot - c["strike"]) <= config.MAX_ITM_DEPTH_PTS]
+        else:
+            candidates = [c for c in candidates
+                          if (c["strike"] - spot) <= config.MAX_ITM_DEPTH_PTS]
 
-        if preferred:
-            # ── If OI available in cache: pick highest OI among preferred ──
-            any_oi = any(c["oi"] > 0 for c in preferred)
-            if any_oi:
-                best = max(preferred, key=lambda x: x["oi"])
+        if not candidates:
+            print(f"[Strike] All cached strikes deeper than {config.MAX_ITM_DEPTH_PTS}pts "
+                  f"from spot {spot:.0f} — live scan")
+            return self._live_scan(spot, direction)
+
+        # ── Budget filter: drop strikes whose cached LTP exceeds per-lot limit ──
+        # max_ltp = MAX_OPTION_COST_PER_LOT_RS / LOT_SIZE
+        max_ltp = config.MAX_OPTION_COST_PER_LOT_RS / config.LOT_SIZE
+        before  = len(candidates)
+        candidates = [c for c in candidates
+                      if c.get("ltp", 0) <= 0          # ltp unknown — keep, check later
+                      or c["ltp"] <= max_ltp]
+        dropped = before - len(candidates)
+        if dropped:
+            print(f"[Strike] Budget filter (≤Rs{config.MAX_OPTION_COST_PER_LOT_RS:,}/lot "
+                  f"= LTP≤{max_ltp:.0f}pts): dropped {dropped} expensive strike(s)")
+        if not candidates:
+            print(f"[Strike] No {direction} strikes within budget — live scan")
+            return self._live_scan(spot, direction)
+
+        if any_oi:
+            # ── Full filter: delta + OI ──────────────────────
+            valid = [c for c in candidates
+                     if c["delta"] >= config.MIN_DELTA and c["oi"] >= config.MIN_OI]
+            if valid:
+                best = valid[0]
                 print(f"[Strike] ✅ {direction} {best['strike']} "
-                      f"depth={abs(spot-best['strike']):.0f}pts ITM  "
-                      f"delta={best['delta']:.2f} OI={best['oi']:,} (best OI of 100/150)")
-                return best
-            else:
-                # OI = 0 in cache — fetch live for both preferred strikes
-                print(f"[Strike] OI=0 in cache — fetching live OI for preferred strikes...")
-                for c in preferred:
-                    live_oi, live_ltp = fetch_oi_and_ltp(self.client, c["token"])
-                    c["oi"] = live_oi
-                    if live_ltp > 0:
-                        c["ltp"] = live_ltp
-                    depth_actual = abs(spot - c["strike"])
-                    oi_tag = f"OI={live_oi:,}" if live_oi > 0 else "OI=? (API no data)"
-                    print(f"[Strike]   {direction} {c['strike']} depth={depth_actual:.0f}pts "
-                          f"delta={c['delta']:.2f}  {oi_tag}  LTP={live_ltp:.1f}")
-                # Pick highest OI of the two (even if 0 — avoid None return)
-                best = max(preferred, key=lambda x: x["oi"])
-                print(f"[Strike] ✅ {direction} {best['strike']} "
-                      f"depth={abs(spot-best['strike']):.0f}pts ITM  "
                       f"delta={best['delta']:.2f} OI={best['oi']:,}")
                 return best
 
-        # ── FALLBACK: preferred depths not in cache — pick closest ITM ───
-        # Sort remaining by how close they are to 100 pts ITM
-        print(f"[Strike] Preferred depths not cached — picking closest available ITM")
-        candidates.sort(key=lambda x: x["delta"], reverse=True)
+            # OI filter too strict — try delta only
+            delta_ok = [c for c in candidates if c["delta"] >= config.MIN_DELTA]
+            if delta_ok:
+                best = delta_ok[0]
+                print(f"[Strike] ⚠️  {direction} {best['strike']} OI below threshold "
+                      f"delta={best['delta']:.2f} OI={best['oi']:,} — using anyway")
+                return best
 
-        # Filter: must be at least somewhat ITM (delta >= 0.50)
-        itm_ok = [c for c in candidates if c["delta"] >= 0.50]
-        if not itm_ok:
-            itm_ok = candidates  # use anything if nothing passes
+        else:
+            # ── OI came back 0 from preload (API limitation) ─
+            # Filter on delta only, then do ONE live OI fetch for top candidate
+            delta_ok = [c for c in candidates if c["delta"] >= config.MIN_DELTA]
+            if delta_ok:
+                # Fetch OI live for the top few candidates to find one with good OI
+                print(f"[Strike] OI=0 in cache — fetching live OI for top candidates...")
+                for candidate in delta_ok[:5]:  # check top 5 delta-wise
+                    tok = candidate["token"]
+                    live_oi, live_ltp = fetch_oi_and_ltp(self.client, tok)
+                    candidate["oi"]  = live_oi
+                    if live_ltp > 0:
+                        candidate["ltp"] = live_ltp
+                    oi_tag = f"OI={live_oi:,}" if live_oi > 0 else "OI=? (API no data)"
+                    print(f"[Strike]   {direction} {candidate['strike']}: "
+                          f"delta={candidate['delta']:.2f}  {oi_tag}  LTP={live_ltp:.1f}")
+                    if live_oi >= config.MIN_OI:
+                        print(f"[Strike] ✅ {direction} {candidate['strike']} "
+                              f"delta={candidate['delta']:.2f} OI={live_oi:,}")
+                        return candidate
 
-        # Among available, prefer the one closest to 125 pts ITM (midpoint of 100/150)
-        target_depth = 125.0
-        itm_ok.sort(key=lambda x: abs(abs(spot - x["strike"]) - target_depth))
-        best = itm_ok[0]
-        depth_actual = abs(spot - best["strike"])
-        print(f"[Strike] ✅ {direction} {best['strike']} depth={depth_actual:.0f}pts ITM "
-              f"delta={best['delta']:.2f} OI={best['oi']:,} (fallback — nearest to 100/150)")
-        return best
+                # Nothing passed OI — use highest delta anyway (OI unknown/low)
+                best = delta_ok[0]
+                print(f"[Strike] ⚠️  {direction} {best['strike']} using best delta "
+                      f"(OI API returned 0 — check OI_DEBUG log above) "
+                      f"delta={best['delta']:.2f}")
+                return best
 
         # ── Guaranteed fallback: best available ITM candidate ─────────────
         # Never return None from cache — always trade something sensible.

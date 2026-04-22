@@ -1,12 +1,14 @@
 # ============================================================
-# CONFIG.PY — Nifty Futures VWAP Options Algo v3
+# CONFIG.PY — Nifty 9:29–9:45 VWAP Touch Strategy v5
 # ============================================================
-# Signal  : Nifty current-month futures VWAP cross (tick level)
-# Buy CE  : futures crosses above VWAP → buy ITM CE
-# Buy PE  : futures crosses below VWAP → buy ITM PE
-# SL/TGT  : VIX-based (high VIX: SL=15 TGT=50 | low VIX: SL=10 TGT=35)
-# Trail   : always active — SL ratchets up once +20 pts in profit
-# Capital : Rs 30,000 · 1 lot
+# Window  : 9:29 AM to 9:45 AM only
+# Signal  : Nifty Futures comes within 5pts of VWAP
+# CE trade: price above VWAP -> buy ITM CE
+# PE trade: price below VWAP -> buy ITM PE
+# SL      : -10 pts (option premium)
+# Target  : +40 pts (option premium)
+# Trail   : +10->BE | +20->lock+10 | +30->lock+20
+# Entries : Multiple (each fresh zone-touch after price leaves)
 # ============================================================
 
 import os
@@ -29,7 +31,7 @@ def _load_env(path=".env"):
 _load_env()
 
 # ── Mode ──────────────────────────────────────────────────
-PAPER_TRADE         = True    # Set False only when ready for live
+PAPER_TRADE         = True
 
 # ── Kotak Neo Credentials (from .env) ─────────────────────
 KOTAK_CONSUMER_KEY    = os.getenv("KOTAK_CONSUMER_KEY",    "")
@@ -40,160 +42,87 @@ KOTAK_MPIN            = os.getenv("KOTAK_MPIN",            "")
 KOTAK_ENVIRONMENT     = os.getenv("KOTAK_ENVIRONMENT",     "prod")
 
 # ── Capital & Position Sizing ─────────────────────────────
-TOTAL_CAPITAL       = 30000    # Rs 30,000 deployed
-LOTS                = 1        # 1 lot for Rs30k capital (65 qty × 1 lot)
-LOT_SIZE            = 65       # Nifty lot size
+TOTAL_CAPITAL       = 500000
+LOTS                = 5
+LOT_SIZE            = 65
 INITIAL_CAPITAL     = TOTAL_CAPITAL
 
-# ── VIX threshold ─────────────────────────────────────────
-VIX_HIGH_THRESHOLD  = 15.0    # VIX > 15 = high volatility
+# ── Session Window ────────────────────────────────────────
+MARKET_OPEN         = "09:15"
+ENTRY_WINDOW_START  = "09:29"   # First possible entry
+ENTRY_WINDOW_END    = "09:45"   # No NEW entries after this
+SQUARE_OFF_TIME     = "15:25"   # Square off any open position
+EXPIRY_DAY_CUTOFF   = "14:30"
 
-# ── SL and Target (VIX-based) ─────────────────────────────
-# ── Early session (9:16–9:39) ────────────────────────────
-EARLY_SESSION_END       = "09:30"   # set same as entry start — early session disabled
-EARLY_SESSION_MAX_TRADES= 2         # max 2 trades in early session
-EARLY_SL_PTS            = 7.0       # tight SL in early session
-EARLY_TRAIL_1_TRIGGER   = 25.0      # +25 → SL = entry + 5
-EARLY_TRAIL_1_LOCK      = 5.0
-EARLY_TRAIL_2_TRIGGER   = 35.0      # +35 → SL = entry + 25
-EARLY_TRAIL_2_LOCK      = 25.0
-EARLY_TARGET_PTS        = 45.0      # book profit at +45
-EARLY_LOSS_WAIT_MINS    = 10        # after a losing trade, wait 10 min before 2nd
+# ── VWAP Touch Zone ───────────────────────────────────────
+# A signal fires when |futures_ltp - vwap| <= VWAP_TOUCH_DIST
+# Direction: ltp > vwap -> CE   |   ltp < vwap -> PE
+# ltp == vwap (within 1pt) -> skip (too close to call direction)
+VWAP_TOUCH_DIST     = 5.0    # pts from VWAP to trigger entry
+VWAP_DIRECTION_MIN  = 0.5    # min dist from VWAP to establish direction
 
-# ── Normal session (9:40 onward) ─────────────────────────
-SL_PTS_HIGH_VIX         = 15.0      # kept for VIX reference but overridden below
-TARGET_PTS_HIGH_VIX     = 50.0
-SL_PTS_LOW_VIX          = 10.0
-TARGET_PTS_LOW_VIX      = 35.0
+# Reset guard: after a signal fires, price must move at least
+# VWAP_RESET_DIST away from VWAP before the zone is "armed" again.
+# Prevents repeated signals while price is hugging VWAP.
+VWAP_RESET_DIST     = 8.0    # pts away from VWAP to re-arm zone
 
-NORMAL_SL_PTS           = 15.0      # fixed SL for normal session
-NORMAL_TARGET_PTS       = 50.0      # target
-# Trail ladder (profit_pts → new SL offset from entry)
-NORMAL_TRAIL_1_TRIGGER  = 20.0      # +20 → breakeven (entry + 1)
-NORMAL_TRAIL_1_LOCK     = 1.0
-NORMAL_TRAIL_2_TRIGGER  = 30.0      # +30 → entry + 10
-NORMAL_TRAIL_2_LOCK     = 10.0
-NORMAL_TRAIL_3_TRIGGER  = 35.0      # +35 → entry + 20
-NORMAL_TRAIL_3_LOCK     = 20.0
-NORMAL_TRAIL_4_TRIGGER  = 40.0      # +40 → entry + 25
-NORMAL_TRAIL_4_LOCK     = 25.0
-NORMAL_TRAIL_STEP_START = 45.0      # from +45 trail every 5 pts
-NORMAL_TRAIL_STEP_SIZE  = 5.0       # step size for continuous trail
+# Minimum ticks before VWAP is trusted
+VWAP_MIN_TICKS      = 3
 
-# ── Trailing SL ───────────────────────────────────────────
-# Step 1: +20 pts → SL moves to entry (breakeven)
-# Step 2: +30 pts → SL moves to entry + 10 (locked)
-# SL only ever moves UP — never down.
-# Legacy aliases kept so nothing else breaks
-TRAIL_BREAKEVEN_TRIGGER = 20.0
-TRAIL_LOCK_TRIGGER      = 30.0
-TRAIL_LOCK_PTS          = 10.0
+# ── Budget Cap ────────────────────────────────────────────
+# Maximum cost PER LOT (not total across all lots).
+# cost per lot = option_ltp  x  LOT_SIZE
+# With LOT_SIZE = 65:  25000 / 65 = 384.6 pts max LTP.
+# pick_strike() filters out any strike whose LTP exceeds this.
+# main.py re-checks the live LTP before placing the order as a safety net.
+MAX_OPTION_COST_PER_LOT_RS = 25000   # Rs — budget per lot
+# Derived max option LTP (auto-adjusts if LOT_SIZE ever changes):
+#   max_ltp = MAX_OPTION_COST_PER_LOT_RS / LOT_SIZE = 25000 / 65 = ~384 pts
 
-# ── VWAP source ───────────────────────────────────────────
-VWAP_MIN_TICKS          = 3      # min futures ticks before trusting signals
-CROSS_CONFIRM_TICKS     = 3      # ticks price must stay on new side to confirm a cross
-                                  # prevents single-tick fake crosses from firing signals
+# ── Stop Loss & Target (option premium) ───────────────────
+SL_PTS              = 10.0   # stop loss in option premium points
+TARGET_PTS          = 40.0   # full exit target
 
-# ── Entry proximity filters ───────────────────────────────
-# Fresh cross: enter only if futures is within ±2 pts of VWAP
-FRESH_CROSS_MAX_DIST    = 2.0    # fire if within 2pts of VWAP at cross
+# ── Trailing SL Ladder ────────────────────────────────────
+# Option profit milestone -> new SL offset from entry
+# +10 pts  -> SL = entry        (breakeven)
+# +20 pts  -> SL = entry + 10   (lock +10)
+# +30 pts  -> SL = entry + 20   (lock +20)
+TRAIL_1_TRIGGER     = 10.0
+TRAIL_1_LOCK        = 0.0    # breakeven
 
-# Pullback: enter when futures is within 0–2 pts of VWAP
-PULLBACK_MAX_DIST       = 2.0    # pullback zone: 0 to 2pts from VWAP
-PULLBACK_MIN_DIST       = 0.0    # min distance from VWAP (0 = at VWAP)
+TRAIL_2_TRIGGER     = 20.0
+TRAIL_2_LOCK        = 10.0   # lock +10
 
-# ── VWAP trend filter ──────────────────────────────────────
-# CE trades only when VWAP is rising; PE trades only when VWAP is falling.
-# Tracks one VWAP snapshot per completed minute (at the turn of each minute).
-# Compares the latest snapshot against VWAP_TREND_LOOKBACK minutes ago.
-# Tracking starts from first tick (even pre-9:30) but the filter is only
-# APPLIED to entry decisions after 9:30 AM.
-VWAP_TREND_LOOKBACK     = 3      # compare last N minute-snapshots for trend
-VWAP_TREND_MIN_CHANGE   = 0.5    # minimum change (pts/min window) = trending
-VWAP_TREND_START        = "09:30"  # apply filter from entry-open
+TRAIL_3_TRIGGER     = 30.0
+TRAIL_3_LOCK        = 20.0   # lock +20
 
-# ── 4-Scenario VWAP Strategy (vwap_strategy_engine.py) ────
-# Scenario 1/2/3 — Trending VWAP pullback
-SCENARIO_TREND_MIN_CHANGE_PTS   = 20.0  # VWAP must move ≥20pts over lookback to be "trending"
-SCENARIO_PULLBACK_EXTEND_MIN    = 40.0  # price must have gone ≥40pts from VWAP before pullback
-SCENARIO_PULLBACK_EXTEND_MAX    = 60.0  # price should not exceed 60pts from VWAP (overextended)
-SCENARIO_ENTRY_ZONE_PTS         = 5.0   # price must be within VWAP ± 5 for entry
-SCENARIO_TREND_SL_PTS           = 10.0  # stoploss: 10 pts (as per your strategy)
-SCENARIO_TREND_TARGET_PTS       = 40.0  # target: 40 pts with trailing
-SCENARIO_TREND_TRAIL_TRIGGER    = 20.0  # start trailing at +20pts profit
-SCENARIO_TREND_TRAIL_STEP       = 10.0  # trail every 10pts thereafter
-
-# Scenario 4 — Flat VWAP
-SCENARIO_FLAT_MAX_CHANGE        = 5.0   # VWAP change ≤5pts over lookback = flat
-SCENARIO_FLAT_LOOKBACK_MINS     = 15    # flat check lookback in minutes
-SCENARIO_FLAT_PULLBACK_EXTEND   = 40.0  # price must have moved ≥40pts before flat pullback
-SCENARIO_FLAT_TARGET_PTS        = 25.0  # reduced target for flat: 25pts
-SCENARIO_FLAT_SL_PTS            = 10.0  # stoploss same: 10pts
-
-# Scenario 3 — Trend flip confirmation
-SCENARIO_FLIP_CONFIRM_MINS      = 5     # hold new trend direction for 5 mins to confirm flip
-
-# Option entry confirmation zone
-SCENARIO_OPTION_ENTRY_ZONE_PTS  = 5.0   # ITM option must be within ±5 of option VWAP at entry
-
-# Index VWAP gap threshold — if futures and index VWAP diverge by this much,
-# switch to using index VWAP for entry decisions (avoids futures roll gap issues)
-INDEX_VWAP_FUTURES_GAP_THRESHOLD = 20.0
-
-# ── Pullback trade limit per direction ────────────────────
-MAX_PULLBACK_PER_DIR    = 2      # max pullback entries per direction per day
-
-# ── Confirmation filter (mid-trade cross check) ───────────
-# When already in a trade and futures crosses VWAP again:
-#   option LTP < option VWAP → real reversal → flip/exit
-#   option LTP > option VWAP → just a pullback → hold current trade
-ENABLE_OPTION_VWAP_CONFIRM  = True
-
-# ── Direction fatigue rule ────────────────────────────────
-# After DIRECTION_FATIGUE_COUNT profitable exits in same direction:
-#   → skip next signal in that direction
-#   → re-allow only after DIRECTION_COOLDOWN_MINS minutes
-DIRECTION_FATIGUE_COUNT     = 2      # 2 wins in same direction → cool down
-DIRECTION_COOLDOWN_MINS     = 15     # wait 15 mins before re-entering same dir
-FATIGUE_MIN_PROFIT_PTS      = 10.0   # "profitable" = exit with >= 10 pts gain
-
-# ── Daily guards ──────────────────────────────────────────
-MAX_CONSEC_SL           = 3      # stop after 3 consecutive SL hits
-MAX_DAILY_LOSS_RS       = -3000  # stop if net day loss > Rs 3,000 (10% of 30k)
+# ── Daily Guards ──────────────────────────────────────────
+MAX_DAILY_TRADES        = 3       # hard cap — no new entries after 3 trades
+MAX_CONSEC_SL           = 3
+MAX_DAILY_LOSS_RS       = -15000
 
 # ── Strike pre-loading ────────────────────────────────────
-# At startup, we resolve tokens for several ITM depths for both CE and PE.
-# When a signal fires, we pick from this cache — zero HTTP delay.
-# Continuous ITM range: cache every strike from ATM-50 to ATM-500 (CE)
-# and ATM+50 to ATM+500 (PE) in 50pt steps = 10 strikes per direction.
-# Covers market moving up to 500pts from open ATM without needing live scan.
-PRELOAD_ITM_MIN         = 50      # closest ITM strike to cache (pts from ATM)
-PREFERRED_ITM_DEPTHS    = [100, 150] # always prefer 100 or 150 pts ITM (best OI usually here)
-PRELOAD_ITM_MAX         = 500     # deepest ITM strike to cache (pts from ATM)
-PRELOAD_STEP            = 50      # step size (= STRIKE_STEP)
+PRELOAD_ITM_MIN         = 50
+PRELOAD_ITM_MAX         = 500
+PRELOAD_STEP            = 50
 
-# ── Strike selection (runtime fallback) ───────────────────
-MIN_DELTA           = 0.80
-MIN_OI              = 1200000
-STRIKE_STEP         = 50
-MAX_OI_WALK_STEPS   = 8
-MAX_ITM_DEPTH_PTS   = 350    # never trade option deeper than 350 pts ITM
-IV_PCT              = 12.0
-RISK_FREE_RATE      = 0.065
+# ── Strike selection ──────────────────────────────────────
+MIN_DELTA               = 0.80
+MIN_OI                  = 1200000
+STRIKE_STEP             = 50
+MAX_OI_WALK_STEPS       = 8
+MAX_ITM_DEPTH_PTS       = 350
+IV_PCT                  = 12.0
+RISK_FREE_RATE          = 0.065
 
 # ── Order execution ───────────────────────────────────────
-BUY_LIMIT_BUFFER         = 2.0
-ORDER_STATUS_POLL_SECS   = 1.0
-ORDER_FILL_TIMEOUT_SECS  = 15
-EXIT_FILL_TIMEOUT_SECS   = 12
-EXIT_RETRY_ATTEMPTS      = 3
+BUY_LIMIT_BUFFER        = 2.0
+ORDER_STATUS_POLL_SECS  = 1.0
+ORDER_FILL_TIMEOUT_SECS = 15
+EXIT_FILL_TIMEOUT_SECS  = 12
+EXIT_RETRY_ATTEMPTS     = 3
 ENABLE_AMO_OUTSIDE_HOURS = True
-
-# ── Session timing ────────────────────────────────────────
-MARKET_OPEN         = "09:15"
-ENTRY_START         = "09:30"
-SQUARE_OFF_TIME     = "15:20"
-EXPIRY_DAY_CUTOFF   = "14:30"
 
 # ── Costs ─────────────────────────────────────────────────
 BROKERAGE_PER_ORDER = 20.0
@@ -212,3 +141,46 @@ NIFTY_INDEX_TOKEN   = "26000"
 CAPITAL_FILE        = "capital.json"
 CAPITAL_BACKUP_DAYS = 30
 TRADE_LOG_FILE      = "reports/trade_log.csv"
+
+# ── Legacy aliases (so option_manager / report_manager compile) ───
+VIX_HIGH_THRESHOLD       = 15.0
+SL_PTS_HIGH_VIX          = SL_PTS
+TARGET_PTS_HIGH_VIX      = TARGET_PTS
+SL_PTS_LOW_VIX           = SL_PTS
+TARGET_PTS_LOW_VIX       = TARGET_PTS
+NORMAL_SL_PTS            = SL_PTS
+NORMAL_TARGET_PTS        = TARGET_PTS
+EARLY_SL_PTS             = SL_PTS
+EARLY_TARGET_PTS         = TARGET_PTS
+EARLY_SESSION_END        = "09:40"
+EARLY_SESSION_MAX_TRADES = 99
+EARLY_LOSS_WAIT_MINS     = 0
+EARLY_TRAIL_1_TRIGGER    = TRAIL_1_TRIGGER
+EARLY_TRAIL_1_LOCK       = TRAIL_1_LOCK
+EARLY_TRAIL_2_TRIGGER    = TRAIL_2_TRIGGER
+EARLY_TRAIL_2_LOCK       = TRAIL_2_LOCK
+NORMAL_TRAIL_1_TRIGGER   = TRAIL_1_TRIGGER
+NORMAL_TRAIL_1_LOCK      = TRAIL_1_LOCK
+NORMAL_TRAIL_2_TRIGGER   = TRAIL_2_TRIGGER
+NORMAL_TRAIL_2_LOCK      = TRAIL_2_LOCK
+NORMAL_TRAIL_3_TRIGGER   = TRAIL_3_TRIGGER
+NORMAL_TRAIL_3_LOCK      = TRAIL_3_LOCK
+NORMAL_TRAIL_4_TRIGGER   = TRAIL_3_TRIGGER
+NORMAL_TRAIL_4_LOCK      = TRAIL_3_LOCK
+NORMAL_TRAIL_STEP_START  = 40.0
+NORMAL_TRAIL_STEP_SIZE   = 5.0
+TRAIL_BREAKEVEN_TRIGGER  = TRAIL_1_TRIGGER
+TRAIL_LOCK_TRIGGER       = TRAIL_2_TRIGGER
+TRAIL_LOCK_PTS           = TRAIL_2_LOCK
+FRESH_CROSS_MAX_DIST     = 5.0
+PULLBACK_MAX_DIST        = VWAP_TOUCH_DIST
+PULLBACK_MIN_DIST        = VWAP_DIRECTION_MIN
+VWAP_TREND_LOOKBACK      = 3
+VWAP_TREND_MIN_CHANGE    = 0.5
+VWAP_TREND_START         = "09:16"
+MAX_PULLBACK_PER_DIR     = 99
+ENABLE_OPTION_VWAP_CONFIRM = False
+DIRECTION_FATIGUE_COUNT  = 999
+DIRECTION_COOLDOWN_MINS  = 0
+FATIGUE_MIN_PROFIT_PTS   = 10.0
+CROSS_CONFIRM_TICKS      = 2
