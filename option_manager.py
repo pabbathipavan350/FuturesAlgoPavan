@@ -871,6 +871,9 @@ class OptionManager:
             print(f"[Strike] No {direction} strikes within budget — live scan")
             return self._live_scan(spot, direction)
 
+        # Determine whether the preload captured any OI data at all
+        any_oi = any(c.get("oi", 0) > 0 for c in candidates)
+
         if any_oi:
             # ── Full filter: delta + OI ──────────────────────
             valid = [c for c in candidates
