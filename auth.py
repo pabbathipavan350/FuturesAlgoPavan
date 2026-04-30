@@ -1,47 +1,76 @@
 # ============================================================
-# AUTH.PY — Kotak Neo Login (Final Fixed Version)
+# AUTH.PY — Kotak Neo Login
+# ============================================================
+# Fully CI/CD safe — never hangs on input().
+# TOTP is auto-generated from TOTP_SECRET_KEY in .env
+# If key is missing in CI, fails fast with a clear message.
 # ============================================================
 
 import pyotp
 import logging
 import time
 import os
+import sys
 import config
 from neo_api_client import NeoAPI
 
 logger = logging.getLogger(__name__)
 
-# TOTP secret loaded from .env — never hardcode it here
 TOTP_SECRET_KEY = os.getenv("TOTP_SECRET_KEY", "")
 
 
+def _is_interactive() -> bool:
+    """True only when running in a real interactive terminal."""
+    try:
+        return sys.stdin.isatty()
+    except Exception:
+        return False
+
+
 def generate_totp() -> str:
-    """Auto-generate current TOTP — handles padding automatically"""
-    if not TOTP_SECRET_KEY or TOTP_SECRET_KEY == "YOUR_TOTP_SECRET_KEY":
+    """Auto-generate TOTP from secret key. Returns None on failure."""
+    key = TOTP_SECRET_KEY.strip()
+    if not key or key in ("YOUR_TOTP_SECRET_KEY", ""):
         return None
     try:
-        # Clean and pad the key to valid base32 length
-        key = TOTP_SECRET_KEY.upper().strip().replace(" ", "")
+        key     = key.upper().replace(" ", "")
         padding = (8 - len(key) % 8) % 8
-        key = key + "=" * padding
-        totp = pyotp.TOTP(key)
-        code = totp.now()
-        return code
+        key     = key + "=" * padding
+        return pyotp.TOTP(key).now()
     except Exception as e:
-        print(f"TOTP auto-generation failed: {e}")
+        logger.error(f"TOTP generation failed: {e}")
         return None
+
+
+def _get_totp() -> str:
+    """
+    Get TOTP code:
+    - Auto-generates from TOTP_SECRET_KEY if configured
+    - Interactive terminal: prompts user if key missing
+    - CI/non-interactive: raises immediately (no hang)
+    """
+    code = generate_totp()
+    if code:
+        print(f"Auto-generated TOTP: {code}")
+        return code
+
+    if _is_interactive():
+        print("\n⚠️  TOTP_SECRET_KEY not set in .env")
+        print("Enter your 6-digit TOTP from Google Authenticator:")
+        return input("  TOTP: ").strip()
+    else:
+        raise RuntimeError(
+            "\n❌ TOTP_SECRET_KEY not configured!\n"
+            "Add it to your .env file (the base32 key from Google Authenticator setup).\n"
+            "Example: TOTP_SECRET_KEY = JBSWY3DPEHPK3PXP"
+        )
 
 
 def get_kotak_session() -> NeoAPI:
-    """
-    Authenticate with Kotak Neo API v2.
-    Callbacks are assigned as attributes after creation via setup_websocket().
-    """
-    print("\n" + "="*50)
-    print("  Connecting to Kotak Neo API...")
-    print("="*50)
+    print("\n" + "=" * 50)
+    print("  Connecting to Kotak Neo API  [Gap Algo]")
+    print("=" * 50)
 
-    # Step 1: Initialize client — NO callbacks here, assign after
     client = NeoAPI(
         consumer_key = config.KOTAK_CONSUMER_KEY,
         environment  = config.KOTAK_ENVIRONMENT,
@@ -49,115 +78,59 @@ def get_kotak_session() -> NeoAPI:
         neo_fin_key  = None,
     )
 
-    # Step 2: Generate TOTP
-    totp_code = generate_totp()
+    totp_code = _get_totp()
 
-    if totp_code:
-        print(f"Auto-generated TOTP: {totp_code}")
-    else:
-        print("Please open Google Authenticator and enter your Kotak TOTP:")
-        totp_code = input("  Enter 6-digit TOTP: ").strip()
-
-    # Step 3: TOTP Login
-    try:
-        login_response = client.totp_login(
-            mobilenumber=config.KOTAK_MOBILE_NUMBER,
-            ucc=config.KOTAK_UCC,
-            totp=totp_code
-        )
-    except Exception as e:
-        # Try alternate parameter name
+    # ── TOTP Login ────────────────────────────────────────
+    login_resp = None
+    for fn_kwargs in [
+        {"mobilenumber": config.KOTAK_MOBILE_NUMBER, "ucc": config.KOTAK_UCC, "totp": totp_code},
+        {"mobile_number": config.KOTAK_MOBILE_NUMBER, "ucc": config.KOTAK_UCC, "totp": totp_code},
+    ]:
         try:
-            login_response = client.totp_login(
-                mobile_number=config.KOTAK_MOBILE_NUMBER,
+            login_resp = client.totp_login(**fn_kwargs)
+            if login_resp:
+                break
+        except Exception:
+            continue
+
+    if not login_resp:
+        raise Exception("TOTP Login failed — check credentials in .env")
+
+    # If API returned an error, retry once with fresh TOTP (clock skew)
+    if isinstance(login_resp, dict) and login_resp.get("error"):
+        print("⚠️  TOTP rejected — waiting 30s and retrying with fresh code...")
+        time.sleep(30)
+        totp_code  = generate_totp()
+        if not totp_code:
+            raise Exception("TOTP retry failed — TOTP_SECRET_KEY may be wrong")
+        try:
+            login_resp = client.totp_login(
+                mobilenumber=config.KOTAK_MOBILE_NUMBER,
                 ucc=config.KOTAK_UCC,
-                totp=totp_code
+                totp=totp_code,
             )
-        except Exception as e2:
-            raise Exception(f"TOTP Login failed: {e2}\nCheck KOTAK_MOBILE_NUMBER and KOTAK_UCC in config.py")
-
-    # Check login response
-    if not login_response:
-        raise Exception("TOTP Login returned empty response. Check your credentials in config.py")
-
-    # Check for errors in response
-    if isinstance(login_response, dict) and login_response.get("error"):
-        # Retry with manual TOTP
-        print(f"TOTP failed. Please enter manually from Google Authenticator:")
-        for attempt in range(3):
-            totp_code = input(f"  Enter TOTP (attempt {attempt+1}/3): ").strip()
-            try:
-                login_response = client.totp_login(
-                    mobilenumber=config.KOTAK_MOBILE_NUMBER,
-                    ucc=config.KOTAK_UCC,
-                    totp=totp_code
-                )
-                if isinstance(login_response, dict) and not login_response.get("error"):
-                    break
-            except:
-                pass
-            if attempt < 2:
-                print("  Waiting 5 seconds...")
-                time.sleep(5)
+        except Exception as e:
+            raise Exception(f"TOTP Login retry failed: {e}")
 
     print("TOTP Login: SUCCESS")
-    logger.info(f"Login response keys: {list(login_response.keys()) if isinstance(login_response, dict) else type(login_response)}")
-    print(f"  [DEBUG] Login resp: {str(login_response)[:300]}")
 
-    # Step 4: MPIN Validation
-    print("Validating MPIN...")
-    try:
-        # Try passing mpin directly
-        validate_response = client.totp_validate(mpin=config.KOTAK_MPIN)
-    except Exception as e1:
+    # ── MPIN Validation ───────────────────────────────────
+    validated = False
+    for fn_kwargs in [
+        {"mpin": config.KOTAK_MPIN},
+        {"mpin": config.KOTAK_MPIN, "pan": config.KOTAK_UCC},
+    ]:
         try:
-            # Try with pan as fallback
-            validate_response = client.totp_validate(
-                mpin=config.KOTAK_MPIN,
-                pan=config.KOTAK_UCC
-            )
-        except Exception as e2:
-            try:
-                # Try login_response fields if available
-                auth = (login_response.get('auth') or
-                        login_response.get('Auth') or '') \
-                    if isinstance(login_response, dict) else ''
-                sid  = (login_response.get('sid') or
-                        login_response.get('Sid') or '') \
-                    if isinstance(login_response, dict) else ''
-                validate_response = client.totp_validate(
-                    mpin=config.KOTAK_MPIN,
-                    auth=auth,
-                    sid=sid
-                )
-            except Exception as e3:
-                raise Exception(
-                    f"MPIN validation failed: {e3}\n"
-                    f"Please check KOTAK_MPIN in config.py is correct"
-                )
+            resp = client.totp_validate(**fn_kwargs)
+            if resp is not None and not (isinstance(resp, dict) and resp.get("error")):
+                validated = True
+                break
+        except Exception:
+            continue
 
-    # Check validation response
-    if validate_response:
-        if isinstance(validate_response, dict) and validate_response.get("error"):
-            raise Exception(
-                f"MPIN rejected: {validate_response}\n"
-                f"Please check your MPIN in config.py"
-            )
+    if not validated:
+        raise Exception("MPIN validation failed — check KOTAK_MPIN in .env")
 
     print("MPIN Validated: SUCCESS")
-    print("Kotak Neo Authentication Complete!")
-    logger.info("Kotak Neo auth successful")
-
+    print("Kotak Neo Authentication Complete!\n")
     return client
-
-
-def verify_connection(client: NeoAPI) -> bool:
-    """Verify session is active"""
-    try:
-        print("Verifying connection...")
-        limits = client.limits()
-        print("Connection verified!")
-        return True
-    except Exception as e:
-        print(f"Connection verify note: {e} — continuing anyway")
-        return True

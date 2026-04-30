@@ -1,14 +1,43 @@
 # ============================================================
-# CONFIG.PY — Nifty 9:29–9:45 VWAP Touch Strategy v5
+# CONFIG.PY — NSE Gap VWAP Trend Algo v3
 # ============================================================
-# Window  : 9:29 AM to 9:45 AM only
-# Signal  : Nifty Futures comes within 5pts of VWAP
-# CE trade: price above VWAP -> buy ITM CE
-# PE trade: price below VWAP -> buy ITM PE
-# SL      : -10 pts (option premium)
-# Target  : +40 pts (option premium)
-# Trail   : +10->BE | +20->lock+10 | +30->lock+20
-# Entries : Multiple (each fresh zone-touch after price leaves)
+#
+# STRATEGY PHILOSOPHY (v3 — based on live chart analysis):
+#
+#  The core edge is catching stocks where price and VWAP are
+#  moving TOGETHER in the same direction — not against each other.
+#  This means:
+#
+#  MOMENTUM CONTINUATION (primary — new):
+#    A stock gaps up AND stays above rising VWAP all day →
+#    catch on any pullback to VWAP → LONG (ride the trend)
+#
+#    A stock gaps down AND stays below falling VWAP all day →
+#    catch on any bounce to VWAP → SHORT (ride the downtrend)
+#
+#    Examples: RAILTEL, GALLANTT, DEEPAKFERT, NETWEB, AFCONS
+#    all showed this pattern on 15-Apr. INDIANB was the perfect
+#    example of a short — it stayed below falling VWAP for 82 mins.
+#
+#  GAP REVERSAL (secondary — retained with stricter filters):
+#    A gap stock that crosses VWAP with CONFIRMATION (3+ bars
+#    on the right side, not just a single wick cross)
+#
+#  VWAP BREAKOUT (tertiary — breakout from flat period):
+#    Flat VWAP → sudden directional move with volume spike
+#
+# KEY CHANGES FROM v2:
+#   1. MIN_GAP_PCT = 3% — stocks with 3%+ gaps qualify
+#   2. VWAP cross requires 3 bar confirmation (no more wick traps)
+#   3. SL widened from 0.5% to 0.8% — survive normal noise
+#   4. GAP_REVERSAL SL tightened to VWAP level (not fixed %)
+#   5. VWAP data source: exchange 'ap' field (always preferred) +
+#      fallback to REST poll every 15s (not 30s) for fresher data
+#   6. Watchlist expanded from 340 to ~2100 real EQ stocks
+#   7. Minimum intraday volume check at ENTRY TIME (not just scan)
+#   8. Trade budget split: 5 slots for TREND, 3 for REVERSAL/BREAKOUT
+#   9. Consecutive SL pause threshold raised from 4 to 5
+#  10. VWAP_TREND_LONG / VWAP_TREND_SHORT added as new signal types
 # ============================================================
 
 import os
@@ -31,156 +60,172 @@ def _load_env(path=".env"):
 _load_env()
 
 # ── Mode ──────────────────────────────────────────────────
-PAPER_TRADE         = True
+PAPER_TRADE         = True     # Set False only when ready for live
+
+# ── Signal Flip Mode ──────────────────────────────────────
+# When True: invert every signal direction (BUY→SELL, SELL→BUY).
+# The original SL level becomes the profit target.
+# A fixed Rs cap (FLIP_SL_RS) protects on the downside instead
+# of chasing the original target — caps max loss per trade.
+# Motivation: if the algo is losing consistently, the signal may
+# have reliable directional edge IN REVERSE.
+# Set FLIP_SIGNALS = False to revert to original logic instantly.
+FLIP_SIGNALS        = True     # ← master flip switch
+FLIP_SL_RS          = 900      # Rs fixed SL in flip mode (hard stop per trade)
 
 # ── Kotak Neo Credentials (from .env) ─────────────────────
 KOTAK_CONSUMER_KEY    = os.getenv("KOTAK_CONSUMER_KEY",    "")
-KOTAK_CONSUMER_SECRET = os.getenv("KOTAK_CONSUMER_SECRET", "")
 KOTAK_MOBILE_NUMBER   = os.getenv("KOTAK_MOBILE_NUMBER",   "")
 KOTAK_UCC             = os.getenv("KOTAK_UCC",             "")
 KOTAK_MPIN            = os.getenv("KOTAK_MPIN",            "")
 KOTAK_ENVIRONMENT     = os.getenv("KOTAK_ENVIRONMENT",     "prod")
 
 # ── Capital & Position Sizing ─────────────────────────────
-TOTAL_CAPITAL       = 500000
-LOTS                = 5
-LOT_SIZE            = 65
-INITIAL_CAPITAL     = TOTAL_CAPITAL
+TOTAL_CAPITAL        = 200_000   # Rs 2,00,000 real capital
+LEVERAGE             = 4         # 4x intraday leverage
+CAPITAL_PER_TRADE    = 25_000    # Rs 25,000 per trade (buying power)
 
-# ── Session Window ────────────────────────────────────────
-MARKET_OPEN         = "09:15"
-ENTRY_WINDOW_START  = "09:29"   # First possible entry
-ENTRY_WINDOW_END    = "09:45"   # No NEW entries after this
-SQUARE_OFF_TIME     = "15:25"   # Square off any open position
-EXPIRY_DAY_CUTOFF   = "14:30"
+# ── Per-type concurrent trade limits (no combined cap) ────
+# Each signal type runs independently up to its own limit.
+# Removing MAX_SIMULTANEOUS lets TREND trades run freely
+# without being blocked by OTHER trades and vice versa.
+MAX_TREND_SLOTS      = 8         # VWAP_TREND_LONG / VWAP_TREND_SHORT
+MAX_OTHER_SLOTS      = 8         # GAP_REVERSAL / VWAP_BREAKOUT
+MAX_TOTAL_OPEN_TRADES = 8        # Hard cap: never more than 8 trades running at once
+                                  # across ALL signal types combined
 
-# ── VWAP Touch Zone ───────────────────────────────────────
-# A signal fires when |futures_ltp - vwap| <= VWAP_TOUCH_DIST
-# Direction: ltp > vwap -> CE   |   ltp < vwap -> PE
-# ltp == vwap (within 1pt) -> skip (too close to call direction)
-VWAP_TOUCH_DIST     = 5.0    # pts from VWAP to trigger entry
-VWAP_DIRECTION_MIN  = 0.5    # min dist from VWAP to establish direction
+# ── Gap Scanner Settings ───────────────────────────────────
+MIN_GAP_PCT          = 3.0       # Stocks with 3%+ gaps qualify
+MAX_GAP_PCT          = 25.0      # Skip extreme circuit moves
+MIN_PREV_VOLUME      = 500_000   # Min previous day volume (liquidity filter)
+MIN_PRICE            = 50.0      # Skip penny stocks
+MIN_INTRADAY_VOLUME  = 100_000   # Min shares traded since 9:15 before entry
+                                  # Filters thin stocks where VWAP is unreliable
+SCAN_BATCH_SIZE      = 50
+SCAN_INTERVAL_SECS   = 300       # Rescan every 5 min for new gaps
 
-# Reset guard: after a signal fires, price must move at least
-# VWAP_RESET_DIST away from VWAP before the zone is "armed" again.
-# Prevents repeated signals while price is hugging VWAP.
-VWAP_RESET_DIST     = 8.0    # pts away from VWAP to re-arm zone
+# ── VWAP Signal Parameters ─────────────────────────────────
+VWAP_MIN_TICKS           = 10    # Minimum ticks before any signal fires
 
-# Minimum ticks before VWAP is trusted
-VWAP_MIN_TICKS      = 3
+# GAP_REVERSAL — the "price crossed VWAP" signal (STRICTER in v3)
+CROSS_BUFFER_PCT         = 0.3   # Entry must be X% from VWAP for gap reversal (allowed range: 0.05 – 0.3)
+CROSS_BUFFER_PCT         = max(0.05, min(0.3, CROSS_BUFFER_PCT))   # Clamp: never below 0.05 or above 0.3
+CROSS_CONFIRM_BARS       = 3     # NEW: require 3 consecutive bars on new side
+                                  # This prevents wick trap entries
+                                  # v2 entered on the FIRST cross — caused 89% SL rate
 
-# ── Budget Cap ────────────────────────────────────────────
-# Maximum cost PER LOT (not total across all lots).
-# cost per lot = option_ltp  x  LOT_SIZE
-# With LOT_SIZE = 65:  25000 / 65 = 384.6 pts max LTP.
-# pick_strike() filters out any strike whose LTP exceeds this.
-# main.py re-checks the live LTP before placing the order as a safety net.
-MAX_OPTION_COST_PER_LOT_RS = 25000   # Rs — budget per lot
-# Derived max option LTP (auto-adjusts if LOT_SIZE ever changes):
-#   max_ltp = MAX_OPTION_COST_PER_LOT_RS / LOT_SIZE = 25000 / 65 = ~384 pts
+# VWAP_TREND_LONG / VWAP_TREND_SHORT — the primary new signal
+TREND_CONFIRM_BARS       = 15    # Bars above/below VWAP to confirm trend direction
+TREND_PULLBACK_PCT       = 0.4   # Max distance from VWAP to consider "at VWAP"
+TREND_VWAP_SLOPE_MIN     = 0.003 # Min VWAP slope %/min to confirm directional trend
+                                  # A flat VWAP = no trend = no entry
+                                  # RAILTEL, GALLANTT, DEEPAKFERT all had rising VWAP
+TREND_MIN_CANDLES_ONSIDE = 20    # Price must have been on trend side for 20+ bars
 
-# ── Stop Loss & Target (option premium) ───────────────────
-SL_PTS              = 10.0   # stop loss in option premium points
-TARGET_PTS          = 40.0   # full exit target
+# VWAP_BREAKOUT
+FLAT_MIN_MINUTES     = 90
+BREAKOUT_DIST_PCT    = 0.5
+BREAKOUT_VOL_MULT    = 1.8
 
-# ── Trailing SL Ladder ────────────────────────────────────
-# Option profit milestone -> new SL offset from entry
-# +10 pts  -> SL = entry        (breakeven)
-# +20 pts  -> SL = entry + 10   (lock +10)
-# +30 pts  -> SL = entry + 20   (lock +20)
-TRAIL_1_TRIGGER     = 10.0
-TRAIL_1_LOCK        = 0.0    # breakeven
+# ── SL & Target ───────────────────────────────────────────
+SL_PCT               = 0.8       # WIDENED from 0.5% — survive normal noise
+                                  # 0.5% was being stopped by 1-2 candle wicks
+                                  # on stocks that eventually moved correctly
 
-TRAIL_2_TRIGGER     = 20.0
-TRAIL_2_LOCK        = 10.0   # lock +10
+TRAIL_TRIGGER_PCT    = 1.0       # Trail activates at +1% profit
+TRAIL_BUFFER_PCT     = 0.5       # Trail SL = peak - 0.5%
+TARGET_PCT           = 3.0       # Hard target 3% (raised from 2.5%)
 
-TRAIL_3_TRIGGER     = 30.0
-TRAIL_3_LOCK        = 20.0   # lock +20
+# For GAP_REVERSAL specifically — SL is placed just above VWAP at entry
+# (tighter, because VWAP is the thesis — if price goes back above VWAP
+#  after a SHORT reversal, the trade is wrong)
+GAP_REVERSAL_SL_BUFFER = 0.5    # Place SL 0.5% beyond VWAP level at entry
 
-# ── Daily Guards ──────────────────────────────────────────
-MAX_DAILY_TRADES        = 3       # hard cap — no new entries after 3 trades
-MAX_CONSEC_SL           = 3
-MAX_DAILY_LOSS_RS       = -15000
+# ── Timing Guards ─────────────────────────────────────────
+MARKET_OPEN          = "09:15"
+ENTRY_START          = "09:30"
+SQUARE_OFF_TIME      = "15:10"
 
-# ── Strike pre-loading ────────────────────────────────────
-PRELOAD_ITM_MIN         = 50
-PRELOAD_ITM_MAX         = 500
-PRELOAD_STEP            = 50
+# ── VWAP Data Strategy ────────────────────────────────────
+# PRIMARY:   Exchange 'ap' field on WS ticks (most accurate)
+# SECONDARY: REST poll every 15s (increased from 30s for fresher data)
+# TERTIARY:  Self-compute from (H+L+C)/3 × volume (fallback only)
+#
+# WHY NOT WebSocket for ALL 2000+ stocks:
+#   Subscribing 2000+ stocks floods the single WS connection.
+#   Strategy: subscribe ONLY gap stocks (30–100 stocks) via WS.
+#   For non-gap stocks in the trend watchlist, use REST batch poll.
+#   This gives real VWAP data without overloading the connection.
+REST_POLL_INTERVAL   = 15        # Poll gap stocks every 15s (was 30s)
+REST_TREND_INTERVAL  = 60        # Poll full watchlist for trend scan every 60s
+                                  # Only need to detect trend — not tick precision
 
-# ── Strike selection ──────────────────────────────────────
-MIN_DELTA               = 0.80
-MIN_OI                  = 1200000
-STRIKE_STEP             = 50
-MAX_OI_WALK_STEPS       = 8
-MAX_ITM_DEPTH_PTS       = 350
-IV_PCT                  = 12.0
-RISK_FREE_RATE          = 0.065
+# ── v4 Guards ─────────────────────────────────────────────
+# GAP_DIRECTION_LOCK: GAP_UP stocks → SHORT entries only
+#                     GAP_DOWN stocks → LONG entries only
+# Prevents algo from going LONG on a stock that just gapped up
+# (which is betting against the gap-fill thesis entirely)
+GAP_DIRECTION_LOCK   = True
 
-# ── Order execution ───────────────────────────────────────
-BUY_LIMIT_BUFFER        = 2.0
-ORDER_STATUS_POLL_SECS  = 1.0
-ORDER_FILL_TIMEOUT_SECS = 15
-EXIT_FILL_TIMEOUT_SECS  = 12
-EXIT_RETRY_ATTEMPTS     = 3
-ENABLE_AMO_OUTSIDE_HOURS = True
+# ── EARLY_TREND Strategy (9:15–10:00 AM window) ───────────
+#
+# Scans all watchlist stocks every 10s from 9:15 AM.
+# Filters: gap ≥2% (up or down), price ≥ Rs300.
+# Entry: VWAP continuously rising (3 consecutive higher VWAP bars)
+#        + price pulls back into VWAP ± EARLY_ENTRY_BAND_PCT.
+# Entry window: 9:20 AM to 10:00 AM only. No entries after 10:00 AM.
+# Direction: LONG for gap-up stocks, SHORT for gap-down stocks.
+# SL and Target are fixed % — no trailing stop for this strategy.
+# Max 8 open EARLY_TREND trades simultaneously.
+#
+EARLY_TREND_MIN_GAP_PCT    = 2.0    # min gap % to qualify (≥2% up or down)
+EARLY_TREND_MIN_PRICE      = 300.0  # only stocks ≥ Rs300
+EARLY_TREND_ENTRY_START    = "09:20" # no entries before this
+EARLY_TREND_ENTRY_STOP     = "10:00" # no new entries at or after this
+EARLY_TREND_SCAN_INTERVAL  = 10     # REST scan every 10 seconds
+EARLY_TREND_VWAP_BARS      = 3      # need 3 consecutive rising/falling VWAP bars
+EARLY_TREND_BAND_PCT       = 0.2    # entry allowed when price within ±0.2% of VWAP
+EARLY_TREND_SL_PCT         = 0.7    # fixed SL 0.7% from entry
+EARLY_TREND_TARGET_PCT     = 1.5    # fixed target 1.5% from entry
+EARLY_TREND_MAX_SLOTS      = 8      # max 8 open EARLY_TREND trades at once
 
-# ── Costs ─────────────────────────────────────────────────
-BROKERAGE_PER_ORDER = 20.0
-STT_PCT             = 0.0005
-EXCHANGE_TXN_PCT    = 0.00053
-SEBI_PCT            = 0.000001
-GST_PCT             = 0.18
-STAMP_DUTY_PCT      = 0.00003
+# ── Daily Risk Guards ─────────────────────────────────────
+MAX_DAILY_LOSS_RS    = -10_000
+MAX_CONSEC_SL        = 5         # RAISED from 4 — avoid hair-trigger pauses
 
-# ── Segments & tokens ─────────────────────────────────────
-FO_SEGMENT          = "nse_fo"
-CM_SEGMENT          = "nse_cm"
-NIFTY_INDEX_TOKEN   = "26000"
+# ── Watchlist Mode ────────────────────────────────────────
+# 'file' → Read from watchlist.csv
+# v3 watchlist has ~2100 EQ stocks from NSE scrip master
+# Filtered: ISIN starts INE (real equity, not ETF/index fund)
+WATCHLIST_MODE       = "file"
+WATCHLIST_FILE       = "watchlist.csv"
+
+# ── Paper Trade Realism ───────────────────────────────────
+# Simulates realistic order book fills in paper mode.
+# When a signal fires, algo fetches live depth and walks the
+# ask/bid levels to compute what a real market order would fill at.
+#
+# PAPER_SLIPPAGE_PCT : fallback fixed slippage when depth fetch fails
+#                      (entry pays more, exit receives less)
+# MAX_BOOK_WALK_PCT  : max % from LTP we allow book walking before we
+#                      stop and accept partial fill at worse avg price.
+#                      Trade is still taken but flagged as THIN_BOOK
+#                      in the log so you can review after 30 days.
+PAPER_SLIPPAGE_PCT   = 0.15   # 0.15% per side fallback slippage
+MAX_BOOK_WALK_PCT    = 0.5    # walk up to 0.5% deep into the book
+
+# ── Costs (equity intraday) ───────────────────────────────
+BROKERAGE_PCT        = 0.0
+STT_INTRADAY_PCT     = 0.00025
+EXCHANGE_TXN_PCT     = 0.0000297
+SEBI_PCT             = 0.000001
+GST_PCT              = 0.18
+STAMP_DUTY_PCT       = 0.00003
+
+# ── Segments ──────────────────────────────────────────────
+CM_SEGMENT           = "nse_cm"
 
 # ── Files ─────────────────────────────────────────────────
-CAPITAL_FILE        = "capital.json"
-CAPITAL_BACKUP_DAYS = 30
-TRADE_LOG_FILE      = "reports/trade_log.csv"
-
-# ── Legacy aliases (so option_manager / report_manager compile) ───
-VIX_HIGH_THRESHOLD       = 15.0
-SL_PTS_HIGH_VIX          = SL_PTS
-TARGET_PTS_HIGH_VIX      = TARGET_PTS
-SL_PTS_LOW_VIX           = SL_PTS
-TARGET_PTS_LOW_VIX       = TARGET_PTS
-NORMAL_SL_PTS            = SL_PTS
-NORMAL_TARGET_PTS        = TARGET_PTS
-EARLY_SL_PTS             = SL_PTS
-EARLY_TARGET_PTS         = TARGET_PTS
-EARLY_SESSION_END        = "09:40"
-EARLY_SESSION_MAX_TRADES = 99
-EARLY_LOSS_WAIT_MINS     = 0
-EARLY_TRAIL_1_TRIGGER    = TRAIL_1_TRIGGER
-EARLY_TRAIL_1_LOCK       = TRAIL_1_LOCK
-EARLY_TRAIL_2_TRIGGER    = TRAIL_2_TRIGGER
-EARLY_TRAIL_2_LOCK       = TRAIL_2_LOCK
-NORMAL_TRAIL_1_TRIGGER   = TRAIL_1_TRIGGER
-NORMAL_TRAIL_1_LOCK      = TRAIL_1_LOCK
-NORMAL_TRAIL_2_TRIGGER   = TRAIL_2_TRIGGER
-NORMAL_TRAIL_2_LOCK      = TRAIL_2_LOCK
-NORMAL_TRAIL_3_TRIGGER   = TRAIL_3_TRIGGER
-NORMAL_TRAIL_3_LOCK      = TRAIL_3_LOCK
-NORMAL_TRAIL_4_TRIGGER   = TRAIL_3_TRIGGER
-NORMAL_TRAIL_4_LOCK      = TRAIL_3_LOCK
-NORMAL_TRAIL_STEP_START  = 40.0
-NORMAL_TRAIL_STEP_SIZE   = 5.0
-TRAIL_BREAKEVEN_TRIGGER  = TRAIL_1_TRIGGER
-TRAIL_LOCK_TRIGGER       = TRAIL_2_TRIGGER
-TRAIL_LOCK_PTS           = TRAIL_2_LOCK
-FRESH_CROSS_MAX_DIST     = 5.0
-PULLBACK_MAX_DIST        = VWAP_TOUCH_DIST
-PULLBACK_MIN_DIST        = VWAP_DIRECTION_MIN
-VWAP_TREND_LOOKBACK      = 3
-VWAP_TREND_MIN_CHANGE    = 0.5
-VWAP_TREND_START         = "09:16"
-MAX_PULLBACK_PER_DIR     = 99
-ENABLE_OPTION_VWAP_CONFIRM = False
-DIRECTION_FATIGUE_COUNT  = 999
-DIRECTION_COOLDOWN_MINS  = 0
-FATIGUE_MIN_PROFIT_PTS   = 10.0
-CROSS_CONFIRM_TICKS      = 2
+TRADE_LOG_FILE       = "reports/trade_log.csv"
+GAP_LIST_FILE        = "reports/gap_list.csv"
+CAPITAL_FILE         = "capital.json"

@@ -1,23 +1,5 @@
 # ============================================================
-# TELEGRAM_NOTIFIER.PY — Optional Trade Alerts via Telegram
-# ============================================================
-# Sends a Telegram message when:
-#   - Trade entry taken
-#   - SL hit / target hit / trade exited
-#   - Daily loss limit hit
-#   - Session reconnect happens
-#   - Circuit breaker suspected
-#
-# SETUP (one time):
-#   1. Message @BotFather on Telegram → /newbot → copy the token
-#   2. Message your bot once, then open:
-#      https://api.telegram.org/bot<TOKEN>/getUpdates
-#      Copy the "chat_id" number from the response
-#   3. Add to your .env file:
-#      TELEGRAM_BOT_TOKEN=your_token_here
-#      TELEGRAM_CHAT_ID=your_chat_id_here
-#
-# If token/chat_id not set → silently disabled, algo runs normally.
+# TELEGRAM_NOTIFIER.PY — Trade Alerts (reused from algo_v3)
 # ============================================================
 
 import os
@@ -35,14 +17,10 @@ except ImportError:
 
 
 class TelegramNotifier:
-    """
-    Sends Telegram messages in a background thread so it never
-    blocks the main algo loop — even if Telegram is slow/down.
-    """
 
     def __init__(self):
-        self.token   = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
-        self.chat_id = os.getenv('TELEGRAM_CHAT_ID', '').strip()
+        self.token   = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+        self.chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
         self.enabled = bool(self.token and self.chat_id and _URLLIB_OK)
 
         if self.enabled:
@@ -52,75 +30,79 @@ class TelegramNotifier:
                   f"(set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID in .env to enable)")
 
     def send(self, message: str):
-        """Send message in background thread — non-blocking."""
         if not self.enabled:
             return
-        threading.Thread(
-            target=self._send_sync,
-            args=(message,),
-            daemon=True,
-            name='TelegramSend'
-        ).start()
+        threading.Thread(target=self._send_sync, args=(message,),
+                         daemon=True, name="TelegramSend").start()
 
     def _send_sync(self, message: str):
-        """Actual HTTP call — runs in background thread."""
         try:
             url  = f"https://api.telegram.org/bot{self.token}/sendMessage"
             data = urllib.parse.urlencode({
-                'chat_id'    : self.chat_id,
-                'text'       : message,
-                'parse_mode' : 'HTML',
-            }).encode('utf-8')
-            req  = urllib.request.Request(url, data=data)
+                "chat_id"   : self.chat_id,
+                "text"      : message,
+                "parse_mode": "HTML",
+            }).encode("utf-8")
+            req = urllib.request.Request(url, data=data)
             with urllib.request.urlopen(req, timeout=8) as resp:
                 if resp.status != 200:
                     logger.debug(f"Telegram HTTP {resp.status}")
         except Exception as e:
             logger.debug(f"Telegram send failed: {e}")
 
-    # ── Pre-formatted alert helpers ──────────────────────────
+    def alert_gap_list(self, gap_up: list, gap_down: list):
+        lines = [f"📊 <b>GAP SCAN COMPLETE</b>"]
+        lines.append(f"🟢 Gap Up  ({len(gap_up)} stocks):")
+        for s in gap_up[:5]:
+            lines.append(f"  {s['symbol']} +{s['gap_pct']:.1f}%")
+        if len(gap_up) > 5:
+            lines.append(f"  ...and {len(gap_up)-5} more")
+        lines.append(f"🔴 Gap Down ({len(gap_down)} stocks):")
+        for s in gap_down[:5]:
+            lines.append(f"  {s['symbol']} {s['gap_pct']:.1f}%")
+        if len(gap_down) > 5:
+            lines.append(f"  ...and {len(gap_down)-5} more")
+        self.send("\n".join(lines))
 
-    def alert_entry(self, direction, strike, entry_price, vwap, sl, target, qty):
-        emoji = "🟢" if direction == 'CE' else "🔴"
-        msg = (
-            f"{emoji} <b>ENTRY — {direction} {strike}</b>\n"
-            f"Price  : ₹{entry_price:.2f}\n"
-            f"VWAP   : ₹{vwap:.2f}\n"
-            f"SL     : ₹{sl:.2f}\n"
-            f"Target : ₹{target:.2f}\n"
-            f"Qty    : {qty}"
+    def alert_entry(self, symbol: str, direction: str, gap_dir: str,
+                    entry: float, vwap: float, sl: float, target: float,
+                    qty: int, gap_pct: float):
+        emoji = "📈" if direction == "LONG" else "📉"
+        self.send(
+            f"{emoji} <b>ENTRY — {direction} {symbol}</b>\n"
+            f"Gap     : {gap_dir} {gap_pct:+.2f}%\n"
+            f"Price   : ₹{entry:.2f}  VWAP: ₹{vwap:.2f}\n"
+            f"SL      : ₹{sl:.2f}\n"
+            f"Target  : ₹{target:.2f}\n"
+            f"Qty     : {qty}"
         )
-        self.send(msg)
 
-    def alert_exit(self, direction, strike, entry_price, exit_price, pnl_pts, net_rs, reason):
+    def alert_exit(self, symbol: str, direction: str, entry: float,
+                   exit_p: float, net_rs: float, reason: str):
         emoji = "✅" if net_rs >= 0 else "❌"
-        msg = (
-            f"{emoji} <b>EXIT — {direction} {strike}</b>\n"
-            f"Entry  : ₹{entry_price:.2f}\n"
-            f"Exit   : ₹{exit_price:.2f}\n"
-            f"P&amp;L   : {pnl_pts:+.1f} pts = ₹{net_rs:+.0f}\n"
-            f"Reason : {reason.split('|')[0].strip()}"
+        self.send(
+            f"{emoji} <b>EXIT — {symbol}</b>\n"
+            f"Entry   : ₹{entry:.2f}  Exit: ₹{exit_p:.2f}\n"
+            f"Net P&amp;L : ₹{net_rs:+.0f}\n"
+            f"Reason  : {reason}"
         )
-        self.send(msg)
 
     def alert_risk(self, message: str):
         self.send(f"⚠️ <b>RISK ALERT</b>\n{message}")
 
-    def alert_session(self, message: str):
-        self.send(f"🔄 <b>SESSION</b>\n{message}")
-
-    def alert_startup(self, mode, expiry, atm):
+    def alert_startup(self, gap_up_count: int, gap_down_count: int, mode: str):
         self.send(
-            f"🚀 <b>ALGO STARTED</b>\n"
-            f"Mode   : {mode}\n"
-            f"Expiry : {expiry}\n"
-            f"ATM    : {atm}"
+            f"🚀 <b>GAP ALGO STARTED</b>\n"
+            f"Mode    : {mode}\n"
+            f"Gap Up  : {gap_up_count} stocks\n"
+            f"Gap Down: {gap_down_count} stocks\n"
+            f"Entry after: 09:30 IST"
         )
 
-    def alert_shutdown(self, trades, net_pnl):
+    def alert_shutdown(self, trades: int, net_pnl: float):
         emoji = "✅" if net_pnl >= 0 else "❌"
         self.send(
-            f"{emoji} <b>ALGO STOPPED</b>\n"
-            f"Trades : {trades}\n"
+            f"{emoji} <b>GAP ALGO STOPPED</b>\n"
+            f"Trades  : {trades}\n"
             f"Net P&amp;L : ₹{net_pnl:+.0f}"
         )

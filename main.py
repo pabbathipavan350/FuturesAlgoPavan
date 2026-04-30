@@ -1,21 +1,14 @@
 # ============================================================
-# MAIN.PY — Nifty 9:29–9:45 VWAP Touch Options Algo  v5
+# MAIN.PY — NSE Gap VWAP Trend Algo v3
 # ============================================================
 #
-# STRATEGY SUMMARY
-# ─────────────────
-#   Window  : 9:29 AM to 9:45 AM (entries only in this window)
-#   Signal  : Nifty Futures comes within 5 pts of VWAP
-#   CE trade: price above VWAP → buy ITM CE
-#   PE trade: price below VWAP → buy ITM PE
-#   SL      : -10 pts option premium (hard stop)
-#   Target  : +40 pts option premium (full exit)
-#   Trail   : +10 → SL to breakeven
-#             +20 → lock +10
-#             +30 → lock +20
-#   Re-entry: zone re-arms once price moves 8+ pts away from VWAP
-#   After 9:45: NO new entries; any open trade managed to SL/TGT/3:25
-#
+# WHAT'S NEW vs v2:
+#   1. REST trend scan loop (every 60s for full watchlist)
+#      → Fetches LTP + ap for ALL watchlist stocks via REST batches
+#      → Feeds VWAP_TREND signal detection on stocks not in gap list
+#      → GALLANTT, NETWEB, DEEPAKFERT would have been caught this way
+#   2. Signals context print includes VWAP slope
+#   3. MAX_CONSEC_SL raised to 5 (was 4)
 # ============================================================
 
 import threading
@@ -24,18 +17,17 @@ import logging
 import logging.handlers
 import os
 import datetime
-import sys
-sys.stdout.reconfigure(line_buffering=True)
 import time
+from typing import Dict, Set
 
 import config
-from auth              import get_kotak_session
-from futures_engine    import FuturesVWAPEngine
-from option_manager    import OptionManager, find_futures_token, fetch_ltp
-from capital_manager   import CapitalManager
-from report_manager    import ReportManager
-from session_manager   import SessionManager
-from telegram_notifier import TelegramNotifier
+from auth               import get_kotak_session
+from gap_scanner        import ScripMaster, PrevCloseFetcher, GapScanner
+from vwap_engine        import VWAPManager
+from trade_manager      import TradeManager
+from report_manager     import ReportManager
+from telegram_notifier  import TelegramNotifier
+from session_manager    import SessionManager
 
 
 def now_ist() -> datetime.datetime:
@@ -44,7 +36,7 @@ def now_ist() -> datetime.datetime:
 
 def setup_logging():
     os.makedirs("logs", exist_ok=True)
-    log_file = f"logs/algo_{now_ist().strftime('%Y%m%d')}.log"
+    log_file = f"logs/gap_algo_{now_ist().strftime('%Y%m%d')}.log"
     fmt      = "%(asctime)s %(levelname)-8s %(name)s | %(message)s"
     root     = logging.getLogger()
     root.setLevel(logging.DEBUG)
@@ -60,222 +52,123 @@ def setup_logging():
     return logging.getLogger("main")
 
 
-class FuturesVWAPAlgo:
+class GapVWAPAlgo:
 
     def __init__(self):
-        self.logger         = setup_logging()
-        self.client         = None
-        self.session_mgr    = None
-        self.opt_mgr        = None
-        self.cap_mgr        = None
-        self.report_mgr     = None
-        self.telegram       = TelegramNotifier()
-        self.futures_engine = FuturesVWAPEngine()
+        self.logger   = setup_logging()
+        self.client   = None
+        self.telegram = TelegramNotifier()
 
-        # Tokens
-        self.futures_token = None
-        self.option_token  = None
+        self.scrip_master = None
+        self.gap_scanner  = None
+        self.vwap_mgr     = VWAPManager()
+        self.report_mgr   = ReportManager()
+        self.trade_mgr    = None
+        self.session_mgr  = None
 
-        # VIX (info only)
-        self.current_vix = 0.0
-        self.high_vix    = True
+        self._gap_up:   list = []
+        self._gap_down: list = []
+        self._watchlist: Dict[str, dict] = {}  # token → gap stock info
+        self._all_scrips: dict = {}             # all watchlist scrips for trend scan (symbol→dict)
 
-        # ── Position state ────────────────────────────────
-        self.in_trade     = False
-        self.direction    = None
-        self.strike       = None
-        self.entry_price  = 0.0
-        self.entry_time   = None
-        self.entry_vwap   = 0.0
-        self.sl_price     = 0.0     # option premium SL (absolute)
-        self.target_price = 0.0     # option premium target (absolute)
-        self.peak_price   = 0.0
-        self.low_price    = 0.0
-        self.trail_step   = ""      # last trail label
-        self.trail_active = False
-        self.option_ltp   = 0.0
-        self.qty          = config.LOTS * config.LOT_SIZE
+        self._subscribed_tokens: Set[str] = set()
 
-        # ── Day counters ──────────────────────────────────
-        self.day_pnl_rs  = 0.0
-        self.trade_count = 0
-        self.consec_sl   = 0
-        self.day_stopped = False
+        self._running        = True
+        self._entries_open   = False
+        self._sq_done        = False
 
-        # ── Pre-load ──────────────────────────────────────
-        self._preloaded      = False
-        self._pre_subscribed: dict = {}
-        self._pre_ltp:        dict = {}
+        self._entry_open_t   = datetime.time(*map(int, config.ENTRY_START.split(":")))
+        self._sq_off_t       = datetime.time(*map(int, config.SQUARE_OFF_TIME.split(":")))
 
-        # ── Reconnect guard ───────────────────────────────
-        self._reconnecting   = False
-        self._reconnect_lock = threading.Lock()
+        # EARLY_TREND timing
+        self._early_trend_start_t = datetime.time(
+            *map(int, getattr(config, "EARLY_TREND_ENTRY_START", "09:20").split(":")))
+        self._early_trend_stop_t  = datetime.time(
+            *map(int, getattr(config, "EARLY_TREND_ENTRY_STOP",  "10:00").split(":")))
+        self._early_trend_open    = False   # True between 9:20 and 10:00
+        # token → {symbol, prev_close, gap_pct, direction}
+        self._early_trend_universe: Dict[str, dict] = {}
+        # symbol → deque of recent VWAP readings for slope detection
+        # Each entry is a float (vwap value). We keep last N to check rising/falling.
+        self._early_vwap_history: Dict[str, list] = {}
 
-        # ── Timers ────────────────────────────────────────
-        self._start_time    = now_ist()
-        self._shutdown_time = self._start_time + datetime.timedelta(hours=6, minutes=30)
-
-        # No-tick watchdog
+        self._shutdown_time  = now_ist() + datetime.timedelta(hours=5, minutes=50)
         self._last_tick_time  = now_ist()
         self._circuit_alerted = False
+        self._ws_connected    = False
+        self._ws_reconnecting = False
 
-        self._running = True
         signal.signal(signal.SIGTERM, self._handle_sigterm)
         signal.signal(signal.SIGINT,  self._handle_sigterm)
 
-    # ──────────────────────────────────────────────────────
-    # Initialisation
-    # ──────────────────────────────────────────────────────
+    # ── Initialization ────────────────────────────────────
 
     def initialize(self):
-        print("\n" + "="*60)
-        print("  Nifty 9:29–9:45 VWAP Touch Options Algo  v5")
-        print(f"  Mode    : {'*** PAPER TRADE ***' if config.PAPER_TRADE else '*** LIVE ***'}")
-        print(f"  Capital : Rs {config.TOTAL_CAPITAL:,.0f}  |  "
-              f"{config.LOTS} lots x {config.LOT_SIZE}")
-        print("="*60)
-        print()
-        print("  STRATEGY RULES:")
-        print(f"  Entry window  : {config.ENTRY_WINDOW_START} – {config.ENTRY_WINDOW_END}")
-        print(f"  Signal        : Futures within {config.VWAP_TOUCH_DIST}pts of VWAP")
-        print(f"  Direction     : Above VWAP → CE  |  Below VWAP → PE  (ITM)")
-        print(f"  Stop loss     : -{config.SL_PTS}pts option premium (hard)")
-        print(f"  Target        : +{config.TARGET_PTS}pts option premium (full exit)")
-        print(f"  Trail         : +{config.TRAIL_1_TRIGGER}→BE  "
-              f"+{config.TRAIL_2_TRIGGER}→lock+{config.TRAIL_2_LOCK:.0f}  "
-              f"+{config.TRAIL_3_TRIGGER}→lock+{config.TRAIL_3_LOCK:.0f}")
-        print(f"  Re-arm after  : price moves {config.VWAP_RESET_DIST}pts from VWAP")
-        print(f"  Daily guards  : {config.MAX_CONSEC_SL} consec SL stops day  |  "
-              f"Loss limit Rs{config.MAX_DAILY_LOSS_RS:,.0f}")
-        print("="*60)
+        print("\n" + "=" * 60)
+        print("  NSE GAP VWAP TREND ALGO  v3")
+        print(f"  Mode     : {'*** PAPER TRADE ***' if config.PAPER_TRADE else '*** LIVE ***'}")
+        print(f"  Capital  : ₹{config.TOTAL_CAPITAL:,.0f}  "
+              f"Leverage {config.LEVERAGE}x  "
+              f"₹{config.CAPITAL_PER_TRADE:,.0f}/trade")
+        print(f"  Gap ≥    : {config.MIN_GAP_PCT}%  (raised from 3% — stronger gaps only)")
+        print(f"  SL       : {config.SL_PCT}%  Target: {config.TARGET_PCT}%  "
+              f"Trail: activates at +{config.TRAIL_TRIGGER_PCT}%")
+        print(f"  Slots    : Trend {config.MAX_TREND_SLOTS} | Other {config.MAX_OTHER_SLOTS}")
+        print(f"  Confirm  : {config.CROSS_CONFIRM_BARS} bars for reversal  "
+              f"| {config.TREND_MIN_CANDLES_ONSIDE} bars for trend")
+        et_start = getattr(config, "EARLY_TREND_ENTRY_START", "09:20")
+        et_stop  = getattr(config, "EARLY_TREND_ENTRY_STOP",  "10:00")
+        et_slots = getattr(config, "EARLY_TREND_MAX_SLOTS",   8)
+        print(f"  EarlyTrend: gap≥{getattr(config,'EARLY_TREND_MIN_GAP_PCT',2)}%  "
+              f"price≥Rs{getattr(config,'EARLY_TREND_MIN_PRICE',300):.0f}  "
+              f"SL {getattr(config,'EARLY_TREND_SL_PCT',0.7)}%  "
+              f"Tgt {getattr(config,'EARLY_TREND_TARGET_PCT',1.5)}%  "
+              f"window {et_start}–{et_stop}  "
+              f"max {et_slots} slots")
+        print("=" * 60)
 
-        self._start_time    = now_ist()
-        self._shutdown_time = self._start_time + datetime.timedelta(hours=6, minutes=30)
-        print(f"\n[Init] Started       : {self._start_time.strftime('%H:%M:%S')} IST")
-        print(f"[Init] Auto-shutdown : {self._shutdown_time.strftime('%H:%M:%S')} IST")
+        self._shutdown_time = now_ist() + datetime.timedelta(hours=5, minutes=50)
+        print(f"  Started  : {now_ist().strftime('%H:%M:%S')} IST")
+        print(f"  Auto-stop: {self._shutdown_time.strftime('%H:%M:%S')} IST")
+        print("=" * 60)
 
-        self.client      = get_kotak_session()
+        self.client = get_kotak_session()
         self.session_mgr = SessionManager(self.client, get_kotak_session)
         self.session_mgr.on_reconnect = self._on_reconnect
         self.session_mgr.start()
 
-        self.cap_mgr    = CapitalManager()
-        self.opt_mgr    = OptionManager(self.client)
-        self.report_mgr = ReportManager(self.cap_mgr)
+        self.trade_mgr = TradeManager(self.client, self.report_mgr)
+        self.trade_mgr.set_telegram(self.telegram)  # FIX-3: partial fill alerts
 
-        self._resolve_futures_token()
-        self._fetch_vix()
+        self.scrip_master = ScripMaster(self.client)
+        scrips = self.scrip_master.load(mode=config.WATCHLIST_MODE)
+        self._all_scrips = scrips   # store for trend REST scan
+
+        self.gap_scanner = GapScanner(self.client, scrips)
+
         self._setup_websocket()
 
-        exp = self.opt_mgr.expiry_date
-        print(f"[Init] Expiry   : {exp.strftime('%d %b %Y')} "
-              f"(in {(exp - datetime.date.today()).days}d)")
-        print(f"[Init] VIX      : {self.current_vix:.1f}  (info only)")
-        print(f"[Init] Futures  : token={self.futures_token}")
-
-        self._preload_at_startup()
-
-        self.telegram.alert_startup(
-            mode   = "PAPER" if config.PAPER_TRADE else "LIVE",
-            expiry = str(exp),
-            atm    = f"VIX={self.current_vix:.1f}",
-        )
-        print("\n[Init] Ready — watching for VWAP touches from "
-              f"{config.ENTRY_WINDOW_START} IST\n")
-
-    def _preload_at_startup(self):
-        spot = self._fetch_spot_from_futures_token()
-        if spot <= 0:
-            spot = self._fetch_nifty_spot()
-        if spot <= 0:
-            spot = 24000.0
-            print(f"[PreLoad] Spot fetch failed — using estimate {spot:.0f}")
-        print(f"[PreLoad] Startup spot: {spot:.0f} — pre-loading strikes...")
-        try:
-            self.opt_mgr.preload_strikes(spot)
-            self._preloaded = True
-            self._subscribe_preloaded_options()
-            print("[PreLoad] Done — all strikes cached and subscribed")
-        except Exception as e:
-            self.logger.error(f"[PreLoad] Error: {e}", exc_info=True)
-            print(f"[PreLoad] Warning — preload error: {e}")
-
-    def _fetch_spot_from_futures_token(self) -> float:
-        if not self.futures_token:
-            return 0.0
-        try:
-            resp = self.client.quotes(
-                instrument_tokens=[{"instrument_token": self.futures_token,
-                                    "exchange_segment": config.FO_SEGMENT}],
-                quote_type="ltp",
-            )
-            data = (resp if isinstance(resp, list) else
-                    resp.get("message") or resp.get("data") or []
-                    if isinstance(resp, dict) else [])
-            if data:
-                for f in ("ltp", "ltP", "last_price", "lastPrice", "close"):
-                    v = data[0].get(f)
-                    if v and float(v) > 0:
-                        return float(v)
-        except Exception as e:
-            self.logger.debug(f"_fetch_spot_from_futures_token: {e}")
-        return 0.0
-
-    def _fetch_nifty_spot(self) -> float:
-        try:
-            resp = self.client.quotes(
-                instrument_tokens=[{"instrument_token": config.NIFTY_INDEX_TOKEN,
-                                    "exchange_segment": config.CM_SEGMENT}],
-                quote_type="ltp"
-            )
-            data = (resp if isinstance(resp, dict)
-                    else (resp.get("message") or resp.get("data") or []))
-            if not isinstance(data, list):
-                data = []
-            if data:
-                for f in ("ltp", "ltP", "last_price", "lastPrice", "close"):
-                    v = data[0].get(f)
-                    if v and float(v) > 0:
-                        return float(v)
-        except Exception as e:
-            self.logger.debug(f"_fetch_nifty_spot: {e}")
-        return 0.0
-
-    def _fetch_vix(self):
-        INDIA_VIX_TOKEN = "26074"
-        try:
-            resp = self.client.quotes(
-                instrument_tokens=[{"instrument_token": INDIA_VIX_TOKEN,
-                                    "exchange_segment": config.CM_SEGMENT}],
-                quote_type="ltp"
-            )
-            data = (resp if isinstance(resp, list) else
-                    resp.get("message") or resp.get("data") or []
-                    if isinstance(resp, dict) else [])
-            if data:
-                vix = float(data[0].get("ltp") or data[0].get("ltP") or 0)
-                if vix > 0:
-                    self.current_vix = vix
-        except Exception as e:
-            self.logger.debug(f"VIX fetch: {e}")
-        if self.current_vix <= 0:
-            self.current_vix = 20.0
-        self.high_vix = self.current_vix > config.VIX_HIGH_THRESHOLD
-        self.report_mgr.set_vix(self.current_vix)
-
-    def _resolve_futures_token(self):
-        expiry_str = self.opt_mgr.expiry_str
-        print(f"[Init] Resolving futures token for expiry {expiry_str}...")
-        self.futures_token = find_futures_token(self.client, self.opt_mgr.expiry_date)
-        if not self.futures_token:
-            raise RuntimeError(
-                f"Could not resolve Nifty futures token for {expiry_str}.")
-
-    # ──────────────────────────────────────────────────────
-    # WebSocket
-    # ──────────────────────────────────────────────────────
+        t = now_ist()
+        print("\n[Init] Initialisation complete.")
+        if t.time() >= datetime.time(*map(int, config.MARKET_OPEN.split(":"))):
+            print(f"[Init] Market already open ({t.strftime('%H:%M')}) — gap scan will run immediately")
+        else:
+            print(f"[Init] Waiting for market open at {config.MARKET_OPEN} IST...")
+        print(f"[Init] Entries unlock at {config.ENTRY_START} IST\n")
 
     def _setup_websocket(self):
+        # Tear down callbacks on the OLD socket before assigning new ones.
+        # This prevents stale StartServer objects from firing on_open/on_message
+        # after the socket has already been closed, which caused the flood of
+        # "Connection is already closed" / "socket is already closed" errors.
+        try:
+            self.client.on_message = None
+            self.client.on_error   = None
+            self.client.on_close   = None
+            self.client.on_open    = None
+        except Exception:
+            pass  # client may already be gone; safe to ignore
+
         self.client.on_message = self._on_message
         self.client.on_error   = self._on_ws_error
         self.client.on_close   = self._on_ws_close
@@ -283,668 +176,997 @@ class FuturesVWAPAlgo:
 
     def _on_ws_open(self, *args):
         print("[WS] Connected")
-        threading.Thread(target=self._resubscribe_all,
-                         daemon=True, name="WSSub").start()
-
-    def _resubscribe_all(self):
-        time.sleep(0.5)
-        self._subscribe_futures()
-        for d, tok in self._pre_subscribed.items():
-            try:
-                self.client.subscribe(
-                    instrument_tokens=[{"instrument_token": tok,
-                                        "exchange_segment": config.FO_SEGMENT}],
-                    isIndex=False, isDepth=False,
-                )
-            except Exception as e:
-                self.logger.debug(f"[WS] Re-sub pre-loaded {d}: {e}")
-        if self.option_token:
-            try:
-                self._subscribe_option(self.option_token)
-            except Exception as e:
-                self.logger.debug(f"[WS] Re-sub active option: {e}")
+        self._ws_connected = True
+        self._ws_reconnecting = False   # clear the reconnect-in-progress flag
 
     def _on_ws_error(self, error):
-        s = str(error)
-        if "already closed" in s.lower() or "nonetype" in s.lower():
-            self.logger.debug(f"[WS] Error (expected): {error}")
-        else:
-            self.logger.error(f"[WS] Error: {error}")
+        err_str = str(error)
+        if "already closed" in err_str or "NoneType" in err_str or \
+                "socket is already closed" in err_str:
+            self.logger.debug(f"[WS] Suppressed stale-socket error: {err_str}")
+            return
+        self.logger.error(f"[WS] Error: {error}")
 
     def _on_ws_close(self, *args):
-        if now_ist().time() >= datetime.time(15, 0):
-            self.logger.debug("[WS] Closed after 15:00")
-            return
+        self._ws_connected = False
         self.logger.warning("[WS] Closed")
         if not self._running:
             return
-        with self._reconnect_lock:
-            if self._reconnecting:
-                return
-            self._reconnecting = True
-        threading.Thread(target=self._ws_reconnect_loop,
-                         daemon=True, name="WSReconnect").start()
+        # Guard: only one reconnect thread at a time
+        if getattr(self, "_ws_reconnecting", False):
+            self.logger.debug("[WS] Reconnect already in progress — skipping duplicate")
+            return
+        self._ws_reconnecting = True
+        threading.Thread(
+            target=self._ws_reconnect_loop,
+            daemon=True,
+            name="WSReconnect"
+        ).start()
 
     def _ws_reconnect_loop(self):
-        delays = [5, 10, 20, 30]
-        try:
-            for attempt, delay in enumerate(delays, 1):
-                if not self._running:
-                    return
-                if now_ist().time() >= datetime.time(15, 0):
-                    return
-                print(f"\n[WS] Reconnect {attempt}/{len(delays)} in {delay}s...")
-                time.sleep(delay)
-                if not self._running:
-                    return
-                try:
-                    self._setup_websocket()
-                    self._subscribe_futures()
-                    print(f"[WS] Reconnected (attempt {attempt})")
-                    return
-                except Exception as e:
-                    self.logger.error(f"[WS] Reconnect {attempt} failed: {e}")
-        finally:
-            with self._reconnect_lock:
-                self._reconnecting = False
-
-    def _subscribe_futures(self):
-        if not self.futures_token:
-            return
-        try:
-            self.client.subscribe(
-                instrument_tokens=[{"instrument_token": self.futures_token,
-                                    "exchange_segment": config.FO_SEGMENT}],
-                isIndex=False, isDepth=False,
-            )
-            print(f"[WS] Subscribed futures token={self.futures_token}")
-        except Exception as e:
-            self.logger.error(f"Subscribe futures: {e}")
-
-    def _subscribe_option(self, token: str):
-        try:
-            self.client.subscribe(
-                instrument_tokens=[{"instrument_token": token,
-                                    "exchange_segment": config.FO_SEGMENT}],
-                isIndex=False, isDepth=False,
-            )
-            self.futures_engine.register_option_token(token)
-        except Exception as e:
-            self.logger.error(f"Subscribe option {token}: {e}")
-
-    def _unsubscribe_option(self, token: str):
-        try:
-            self.client.unsubscribe(
-                instrument_tokens=[{"instrument_token": token,
-                                    "exchange_segment": config.FO_SEGMENT}],
-                isIndex=False, isDepth=False,
-            )
-            self.futures_engine.unregister_option_token(token)
-        except Exception:
-            pass
-
-    def _subscribe_preloaded_options(self):
-        for direction in ["CE", "PE"]:
-            candidates = self.opt_mgr._strike_cache.get(direction, [])
-            if not candidates:
-                continue
-            best = candidates[0]
-            tok  = best["token"]
-            self._pre_subscribed[direction] = tok
-            self._pre_ltp[direction]        = best.get("ltp", 0.0)
+        delays = [5, 15, 30, 60]
+        for attempt, delay in enumerate(delays, 1):
+            if not self._running:
+                self._ws_reconnecting = False
+                return
+            print(f"\n[WS] Reconnect attempt {attempt}/{len(delays)} in {delay}s...")
+            time.sleep(delay)
+            if not self._running:
+                self._ws_reconnecting = False
+                return
             try:
-                self.client.subscribe(
-                    instrument_tokens=[{"instrument_token": tok,
-                                        "exchange_segment": config.FO_SEGMENT}],
-                    isIndex=False, isDepth=False,
-                )
-                print(f"[PreSub] {direction} {best['strike']} "
-                      f"token={tok}  LTP~{best.get('ltp', 0.0):.1f}")
+                self._setup_websocket()
+                # Give the new socket a moment to open before subscribing
+                time.sleep(1)
+                all_tokens = [
+                    {"instrument_token": tok, "exchange_segment": config.CM_SEGMENT}
+                    for tok in self._subscribed_tokens
+                ]
+                if all_tokens:
+                    for i in range(0, len(all_tokens), 50):
+                        self.client.subscribe(
+                            instrument_tokens=all_tokens[i:i+50],
+                            isIndex=False,
+                            isDepth=False,
+                        )
+                        time.sleep(0.5)
+                print(f"[WS] ✅ Reconnected — re-subscribed {len(all_tokens)} tokens")
+                self._ws_reconnecting = False
+                return
             except Exception as e:
-                self.logger.error(f"[PreSub] {direction}: {e}")
+                err_str = str(e).lower()
+                # "closed", "sock", or "none" errors mean the socket isn't fully
+                # torn down yet — wait an extra 10s before the next attempt so
+                # the OS has time to fully release the connection.
+                if "closed" in err_str or "sock" in err_str or "none" in err_str:
+                    self.logger.warning(
+                        f"[WS] Reconnect attempt {attempt} — socket not fully torn down yet, "
+                        f"waiting extra 10s: {e}"
+                    )
+                    time.sleep(10)
+                else:
+                    self.logger.error(f"[WS] Reconnect attempt {attempt} failed: {e}")
+        self._ws_reconnecting = False
+        print("[WS] ❌ All reconnect attempts failed — session manager will handle")
 
-    # ──────────────────────────────────────────────────────
-    # Tick handlers
-    # ──────────────────────────────────────────────────────
+    # ── Gap Scan ─────────────────────────────────────────
+
+    def run_gap_scan(self):
+        is_first_scan = len(self._watchlist) == 0
+        scan_label    = "INITIAL SCAN" if is_first_scan else "RESCAN"
+        print(f"\n[GapScan] {scan_label} at {now_ist().strftime('%H:%M:%S')}...")
+
+        if is_first_scan:
+            print("[GapScan] Fetching previous close prices...")
+            prev_fetcher = PrevCloseFetcher(self.client)
+            prev_close   = prev_fetcher.fetch(self.gap_scanner.scrips)
+            self.gap_scanner.set_prev_close(prev_close)
+            if len(prev_close) == 0:
+                print("[GapScan] ⚠️  WARNING: 0 prev close values.")
+
+        gap_up, gap_down = self.gap_scanner.scan()
+        self._gap_up     = gap_up
+        self._gap_down   = gap_down
+
+        all_gap_stocks = gap_up + gap_down
+        new_stocks     = [s for s in all_gap_stocks
+                          if s["token"] not in self._watchlist]
+
+        print(f"\n{'─'*55}")
+        print(f"  GAP SCAN — {now_ist().strftime('%H:%M')}  [{scan_label}]")
+        print(f"{'─'*55}")
+        print(f"  🟢 GAP UP  ({len(gap_up)} stocks — TREND/REVERSAL SHORT):")
+        for s in gap_up[:12]:
+            tag = " ← NEW" if s["token"] not in self._watchlist else ""
+            print(f"     {s['symbol']:<14} +{s['gap_pct']:.2f}%{tag}")
+        if len(gap_up) > 12:
+            print(f"     ... +{len(gap_up)-12} more")
+        print(f"\n  🔴 GAP DOWN ({len(gap_down)} stocks — TREND/REVERSAL LONG):")
+        for s in gap_down[:12]:
+            tag = " ← NEW" if s["token"] not in self._watchlist else ""
+            print(f"     {s['symbol']:<14} {s['gap_pct']:.2f}%{tag}")
+        print(f"\n  Already watching : {len(self._watchlist)} gap stocks")
+        print(f"  Newly added      : {len(new_stocks)} gap stocks")
+        print(f"{'─'*55}\n")
+
+        if is_first_scan:
+            self.gap_scanner.save_gap_list(gap_up, gap_down)
+
+        if new_stocks:
+            self._subscribe_new_stocks(new_stocks)
+
+        if is_first_scan:
+            # Start REST poll for gap stocks (15s interval)
+            threading.Thread(
+                target=self._rest_poll_loop,
+                daemon=True,
+                name="RESTGapPoller"
+            ).start()
+            # Start REST trend scan for full watchlist (60s interval)
+            threading.Thread(
+                target=self._rest_trend_scan_loop,
+                daemon=True,
+                name="RESTTrendScanner"
+            ).start()
+            # Start EARLY_TREND scan (every 10s, 9:15–10:00 AM window)
+            threading.Thread(
+                target=self._early_trend_scan_loop,
+                daemon=True,
+                name="EarlyTrendScanner"
+            ).start()
+
+        if is_first_scan:
+            self.telegram.alert_gap_list(gap_up, gap_down)
+            self.telegram.alert_startup(
+                gap_up_count   = len(gap_up),
+                gap_down_count = len(gap_down),
+                mode           = "PAPER" if config.PAPER_TRADE else "LIVE",
+            )
+
+    def _subscribe_new_stocks(self, new_stocks: list):
+        tokens_to_sub = []
+        for info in new_stocks:
+            token = info["token"]
+            if token not in self._subscribed_tokens:
+                self._watchlist[token] = info
+                tokens_to_sub.append({
+                    "instrument_token": token,
+                    "exchange_segment": config.CM_SEGMENT,
+                })
+                self.vwap_mgr.add_stock(
+                    symbol        = info["symbol"],
+                    token         = token,
+                    gap_direction = info["direction"],
+                )
+                self._subscribed_tokens.add(token)
+                print(f"[WS] Subscribing {info['direction']} {info['symbol']} "
+                      f"({info['gap_pct']:+.2f}%)")
+
+        if not tokens_to_sub:
+            return
+
+        def _do_subscribe():
+            for i in range(0, len(tokens_to_sub), 50):
+                batch = tokens_to_sub[i:i+50]
+                try:
+                    self.client.subscribe(
+                        instrument_tokens=batch,
+                        isIndex=False,
+                        isDepth=False,
+                    )
+                    time.sleep(1.0)
+                except Exception as e:
+                    self.logger.error(f"[WS] Subscribe error: {e}")
+                    time.sleep(2.0)
+            print(f"[WS] ✅ Subscribed {len(tokens_to_sub)} new stocks  "
+                  f"(total gap stocks: {self.vwap_mgr.active_count})")
+
+        threading.Thread(target=_do_subscribe, daemon=True, name="GapSubscribe").start()
+
+    # ── WebSocket Tick Handler ────────────────────────────
 
     def _on_message(self, message):
         try:
             if not isinstance(message, dict):
                 return
-            if message.get("type", "") not in ("stock_feed", "sf", "index_feed", "if"):
+            msg_type = message.get("type", "")
+            if msg_type not in ("stock_feed", "sf", "index_feed", "if"):
                 return
             ticks = message.get("data", [])
             if not ticks:
                 return
+
             for tick in ticks:
                 token = str(tick.get("tk") or tick.get("token") or
                             tick.get("instrument_token") or "")
-                ltp   = float(tick.get("ltp") or tick.get("ltP") or 0)
-                if ltp <= 0:
+                ltp   = float(tick.get("ltp") or tick.get("ltP") or
+                               tick.get("lp")  or 0)
+                if not token or ltp <= 0:
                     continue
+
                 self._last_tick_time  = now_ist()
                 self._circuit_alerted = False
 
-                # Track pre-subscribed option LTPs
-                for _d, _tok in self._pre_subscribed.items():
-                    if token == str(_tok):
-                        self._pre_ltp[_d] = ltp
-                        break
+                self.vwap_mgr.on_tick(token, tick)
+                self.trade_mgr.on_tick(token, ltp)
 
-                if token == str(self.futures_token):
-                    self._on_futures_tick(tick)
-                elif token == str(self.option_token):
-                    self._on_option_tick(tick)
-
-                self.futures_engine.on_option_tick(token, tick)
+                if self._entries_open and not self.trade_mgr.day_stopped:
+                    self._check_entry_signal(token, ltp)
 
         except Exception as e:
             self.logger.error(f"_on_message: {e}", exc_info=True)
 
-    def _on_futures_tick(self, tick: dict):
-        """Feed to engine; check for new signal if not in trade."""
-        self.futures_engine.on_tick(tick)
+    def _check_entry_signal(self, token: str, ltp: float):
+        # Check gap stocks via watchlist
+        info = self._watchlist.get(token)
+        symbol  = info["symbol"]   if info else None
+        tracker = self.vwap_mgr.get_tracker_by_token(token)
 
-        if not self._is_market_hours(now_ist()):
-            return
-
-        # If in trade, no new entries — manage from option tick
-        if self.in_trade:
-            return
-
-        # Day guards
-        if self.day_stopped:
-            return
-
-        sig, sig_type = self.futures_engine.check_signal()
-        if not sig:
-            return
-
-        state = self.futures_engine.get_state()
-        self._on_signal(sig, sig_type, state["ltp"], state["vwap"], now_ist())
-
-    def _on_option_tick(self, tick: dict):
-        """
-        Manage open trade: apply strict trailing SL, check SL and target.
-        """
-        ltp = float(tick.get("ltp") or tick.get("ltP") or tick.get("lp") or 0)
-        if ltp <= 0 or not self.in_trade:
-            return
-
-        self.option_ltp = ltp
-        if ltp > self.peak_price:
-            self.peak_price = ltp
-        if self.low_price == 0.0 or ltp < self.low_price:
-            self.low_price = ltp
-
-        profit_pts = ltp - self.entry_price
-
-        # ── Strict Trailing SL ────────────────────────────
-        # +10 → SL = entry (breakeven)
-        # +20 → SL = entry + 10
-        # +30 → SL = entry + 20
-        new_sl = self.sl_price
-
-        if profit_pts >= config.TRAIL_3_TRIGGER:        # +30
-            candidate = round(self.entry_price + config.TRAIL_3_LOCK, 2)
-            if candidate > new_sl:
-                new_sl = candidate
-        elif profit_pts >= config.TRAIL_2_TRIGGER:      # +20
-            candidate = round(self.entry_price + config.TRAIL_2_LOCK, 2)
-            if candidate > new_sl:
-                new_sl = candidate
-        elif profit_pts >= config.TRAIL_1_TRIGGER:      # +10
-            candidate = round(self.entry_price + config.TRAIL_1_LOCK, 2)
-            if candidate > new_sl:
-                new_sl = candidate
-
-        if new_sl > self.sl_price:
-            lock = new_sl - self.entry_price
-            self.logger.info(f"[Trail] SL {self.sl_price:.2f} -> {new_sl:.2f} "
-                             f"(+{profit_pts:.1f}pts profit, lock=+{lock:.0f})")
-            print(f"  [Trail] SL raised: {self.sl_price:.2f} -> {new_sl:.2f}  "
-                  f"(profit={profit_pts:+.1f}pts  locked=+{lock:.0f}pts)")
-            self.sl_price     = new_sl
-            self.trail_active = True
-            self.trail_step   = (f"+{profit_pts:.0f}pts->"
-                                 f"SL+{lock:.0f}")
-
-        # ── Target hit ────────────────────────────────────
-        if ltp >= self.target_price:
-            self.logger.info(f"[Exit] TARGET ltp={ltp:.2f} tgt={self.target_price:.2f}")
-            print(f"\n  [TARGET] +{config.TARGET_PTS}pts hit — exiting {self.direction}")
-            self._exit_trade(ltp, f"Target +{config.TARGET_PTS}pts")
-            return
-
-        # ── SL hit ────────────────────────────────────────
-        if ltp <= self.sl_price:
-            reason = "Trail SL" if self.trail_active else "SL"
-            self.logger.info(f"[Exit] {reason} ltp={ltp:.2f} sl={self.sl_price:.2f}")
-            print(f"\n  [SL] {reason} hit — exiting {self.direction} "
-                  f"(LTP={ltp:.2f} SL={self.sl_price:.2f})")
-            self._exit_trade(ltp, reason)
-
-    # ──────────────────────────────────────────────────────
-    # Signal → Entry
-    # ──────────────────────────────────────────────────────
-
-    def _on_signal(self, direction: str, sig_type: str,
-                   futures_ltp: float, futures_vwap: float,
-                   t: datetime.datetime):
-
-        # ── Daily guards ──────────────────────────────────
-        if self.trade_count >= config.MAX_DAILY_TRADES:
-            if not self.day_stopped:
-                self.day_stopped = True
-                msg = f"{config.MAX_DAILY_TRADES} trades done — no more entries today"
-                print(f"\n[Guard] {msg}")
-                self.telegram.alert_risk(msg)
-            return
-
-        if self.consec_sl >= config.MAX_CONSEC_SL:
-            if not self.day_stopped:
-                self.day_stopped = True
-                msg = f"{config.MAX_CONSEC_SL} consecutive SLs — stopped for day"
-                print(f"\n[Guard] {msg}")
-                self.telegram.alert_risk(msg)
-            return
-
-        if self.day_pnl_rs <= config.MAX_DAILY_LOSS_RS:
-            if not self.day_stopped:
-                self.day_stopped = True
-                msg = (f"Daily loss limit Rs{config.MAX_DAILY_LOSS_RS:,.0f} "
-                       f"hit — stopped")
-                print(f"\n[Guard] {msg}")
-                self.telegram.alert_risk(msg)
-            return
-
-        # ── Window guard ──────────────────────────────────
-        # Engine already restricts signals to window, but double-check.
-        win_start = datetime.time(*map(int, config.ENTRY_WINDOW_START.split(":")))
-        win_end   = datetime.time(*map(int, config.ENTRY_WINDOW_END.split(":")))
-        if not (win_start <= t.time() <= win_end):
-            self.logger.info(f"[Guard] Signal outside entry window "
-                             f"({t.strftime('%H:%M:%S')}) — ignored")
-            return
-
-        # ── Square-off / expiry guards ────────────────────
-        sq_time = datetime.time(*map(int, config.SQUARE_OFF_TIME.split(":")))
-        if t.time() >= sq_time:
-            return
-        if datetime.date.today() == self.opt_mgr.expiry_date:
-            cutoff = datetime.time(*map(int, config.EXPIRY_DAY_CUTOFF.split(":")))
-            if t.time() >= cutoff:
+        # Also handle trend signals for non-gap stocks added via REST scan
+        if not symbol:
+            tracker = self.vwap_mgr.get_tracker_by_token(token)
+            if not tracker:
                 return
+            symbol = tracker.symbol
+            info   = {"gap_pct": 0.0, "direction": "NONE"}
 
-        # ── Pick ITM strike ───────────────────────────────
-        if not self._preloaded or not self.opt_mgr._strike_cache.get(direction):
-            print(f"[Signal] Pre-load not ready — running live scan for {direction}")
-
-        info = self.opt_mgr.pick_strike(futures_ltp, direction)
-        if not info:
-            self.logger.error(f"No ITM strike found for {direction}")
-            self.telegram.alert_risk(
-                f"No ITM {direction} strike at {t.strftime('%H:%M')}")
+        if not tracker:
             return
 
-        # ── Get live option LTP ───────────────────────────
-        option_ltp = 0.0
-        for d, pre_tok in self._pre_subscribed.items():
-            if info["token"] == pre_tok and d == direction:
-                ws_ltp = self._pre_ltp.get(d, 0.0)
-                if ws_ltp > 0:
-                    option_ltp = ws_ltp
-                    print(f"[LTP] Pre-subscribed WS LTP: {option_ltp:.2f}")
+        fired, sig_type, direction = tracker.check_signal()
+        if not fired:
+            return
+
+        gap_dir = info.get("direction", "NONE") if info else "NONE"
+
+        if not self.trade_mgr.can_enter(symbol, sig_type,
+                                        gap_direction=gap_dir,
+                                        entry_direction=direction):
+            tracker.mark_signal_used(sig_type)
+            return
+
+        vwap      = tracker.vwap
+        slope     = tracker.get_vwap_slope()
+        gap_pct   = info.get("gap_pct", 0.0) if info else 0.0
+        gap_dir   = info.get("direction", "NONE") if info else "NONE"
+
+        self.logger.info(f"[Signal] {symbol} {direction} [{sig_type}]  "
+                         f"LTP={ltp:.2f} VWAP={vwap:.2f}  slope={slope:+.4f}%/min")
+        print(f"\n🔔 SIGNAL: {direction} {symbol}  [{sig_type}]")
+        print(f"   LTP ₹{ltp:.2f}  VWAP ₹{vwap:.2f}  "
+              f"Dist {abs(ltp-vwap)/vwap*100:.2f}%  "
+              f"VWAP slope: {slope:+.4f}%/min")
+
+        trade = self.trade_mgr.enter(
+            symbol        = symbol,
+            token         = token,
+            direction     = direction,
+            ltp           = ltp,
+            vwap          = vwap,
+            gap_pct       = gap_pct,
+            gap_direction = gap_dir,
+            signal_type   = sig_type,
+        )
+
+        if trade:
+            tracker.mark_signal_used(sig_type)
+            self.telegram.alert_entry(
+                symbol    = symbol,
+                direction = direction,
+                gap_dir   = gap_dir,
+                entry     = trade.entry_price,
+                vwap      = vwap,
+                sl        = trade.sl_price,
+                target    = trade.target_price,
+                qty       = trade.qty,
+                gap_pct   = gap_pct,
+            )
+
+    # ── REST poll loop (gap stocks, every 15s) ────────────
+
+    def _rest_poll_loop(self):
+        """
+        REST poll every 15s for GAP stocks only.
+        Higher frequency than v2 (was 30s) for fresher VWAP data.
+        WS is primary; this is the fallback/confirmation.
+        """
+        print("[REST] Gap poll loop started — every 15s")
+
+        while self._running:
+            time.sleep(getattr(config, "REST_POLL_INTERVAL", 15))
+            if not self._running:
                 break
 
-        if option_ltp <= 0:
-            print(f"[LTP] Fetching live REST LTP for {direction} {info['strike']}...")
-            option_ltp = fetch_ltp(self.client, info["token"])
+            gap_tokens = list(self._subscribed_tokens)
+            if not gap_tokens:
+                continue
 
-        if option_ltp <= 0:
-            self.logger.error(
-                f"Cannot get LTP for {direction} {info['strike']} — abort")
-            return
+            instruments = [
+                {"instrument_token": tok, "exchange_segment": config.CM_SEGMENT}
+                for tok in gap_tokens
+            ]
 
-        print(f"[Strike] {direction} {info['strike']}  "
-              f"delta={info['delta']:.2f}  OI={info['oi']:,}  LTP={option_ltp:.2f}")
+            try:
+                for i in range(0, len(instruments), 50):
+                    batch = instruments[i:i+50]
+                    resp  = self.client.quotes(
+                        instrument_tokens=batch,
+                        quote_type="ltp",
+                    )
+                    items = []
+                    if isinstance(resp, dict):
+                        items = resp.get("data", resp.get("success", []))
+                    elif isinstance(resp, list):
+                        items = resp
 
-        # ── Place buy order ───────────────────────────────
-        fill = self.opt_mgr.place_buy_order(
-            token=info["token"], strike=info["strike"],
-            direction=direction, ltp=option_ltp,
-        )
-        if not fill:
-            self.logger.error("Buy order not filled — aborting entry")
-            return
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        tok = str(item.get("instrument_token") or
+                                  item.get("tk") or item.get("token") or "")
+                        if not tok:
+                            continue
+                        ltp_val = self._extract_ltp(item)
+                        ap_val  = self._extract_ap(item)
+                        if ltp_val <= 0:
+                            continue
+                        synthetic_tick = {"ltp": ltp_val, "ap": ap_val}
+                        self.vwap_mgr.on_tick(tok, synthetic_tick, from_ws=False)
+                        self.trade_mgr.on_tick(tok, ltp_val)
+                        if self._entries_open and not self.trade_mgr.day_stopped:
+                            self._check_entry_signal(tok, ltp_val)
+                    time.sleep(0.3)
 
-        fill_px = fill["fill_price"]
+            except Exception as e:
+                self.logger.warning(f"[REST] Gap poll error: {e}")
 
-        # ── Set trade state ───────────────────────────────
-        self.in_trade     = True
-        self.direction    = direction
-        self.strike       = info["strike"]
-        self.option_token = info["token"]
-        self.entry_price  = fill_px
-        self.entry_time   = t
-        self.entry_vwap   = futures_vwap
-        self.sl_price     = round(fill_px - config.SL_PTS, 2)
-        self.target_price = round(fill_px + config.TARGET_PTS, 2)
-        self.peak_price   = fill_px
-        self.low_price    = fill_px
-        self.trail_step   = ""
-        self.trail_active = False
-        self.option_ltp   = fill_px
-        self.trade_count += 1
+    # ── REST trend scan (all watchlist, every 60s) ────────
 
-        self._subscribe_option(info["token"])
+    def _rest_trend_scan_loop(self):
+        """
+        KEY NEW FEATURE IN v3:
 
-        print(f"\n{'='*55}")
-        print(f"  ENTRY #{self.trade_count}  [{t.strftime('%H:%M:%S')}]")
-        print(f"  Direction  : {direction}  (price {'above' if direction=='CE' else 'below'} VWAP)")
-        print(f"  Strike     : {info['strike']}  exp={info['expiry_str']}")
-        print(f"  Futures    : {futures_ltp:.2f}  VWAP={futures_vwap:.2f}  "
-              f"dist={abs(futures_ltp-futures_vwap):.1f}pts")
-        print(f"  Fill price : Rs {fill_px:.2f}")
-        print(f"  Stop loss  : Rs {self.sl_price:.2f}  "
-              f"(-{config.SL_PTS:.0f}pts hard)")
-        print(f"  Target     : Rs {self.target_price:.2f}  "
-              f"(+{config.TARGET_PTS:.0f}pts)")
-        print(f"  Trail      : +{config.TRAIL_1_TRIGGER:.0f}→BE  "
-              f"+{config.TRAIL_2_TRIGGER:.0f}→+{config.TRAIL_2_LOCK:.0f}  "
-              f"+{config.TRAIL_3_TRIGGER:.0f}→+{config.TRAIL_3_LOCK:.0f}")
-        print(f"{'='*55}\n")
+        Scans the ENTIRE watchlist every 60s for VWAP_TREND signals.
+        This is how we catch stocks like GALLANTT, NETWEB, DEEPAKFERT
+        that are NOT in the gap list but develop strong VWAP trends
+        during the day.
 
-        self.telegram.alert_entry(
-            direction=direction, strike=info["strike"],
-            entry_price=fill_px, vwap=futures_vwap,
-            sl=self.sl_price, target=self.target_price, qty=self.qty,
-        )
+        Strategy:
+        - Batch-fetch LTP + ap for all ~2100 stocks in 50-stock batches
+        - Feed into VWAPTracker (adds tracker if new)
+        - VWAP_TREND signal check happens on each update
+        - Entry signal fires when price touches VWAP after 20-bar trend
 
-    # ──────────────────────────────────────────────────────
-    # Exit handler
-    # ──────────────────────────────────────────────────────
+        This is different from WS subscription — we're NOT subscribing
+        all 2100 stocks to WS (that would flood the connection).
+        We're using the REST quotes API at 60s intervals, which is
+        enough to detect the trend setup (bars accumulate slowly).
+        """
+        # Wait for market to actually open and first gap scan to complete
+        time.sleep(90)
+        print("[REST] Trend scan loop started — every 60s for full watchlist")
 
-    def _exit_trade(self, exit_ltp: float, reason: str):
-        if not self.in_trade:
-            return
+        while self._running:
+            time.sleep(getattr(config, "REST_TREND_INTERVAL", 60))
+            if not self._running or not self._entries_open:
+                continue
 
-        self.in_trade = False
-        exit_time     = now_ist()
+            # Build instrument list from all scrips (excluding already-subscribed gap stocks)
+            # _all_scrips is a dict: symbol -> {token, symbol, ...} — iterate values
+            instruments = []
+            for scrip in (self._all_scrips.values() if isinstance(self._all_scrips, dict) else self._all_scrips):
+                tok = str(scrip.get("token") or scrip.get("instrument_token") or "")
+                if tok and tok not in self._subscribed_tokens:
+                    instruments.append({
+                        "instrument_token": tok,
+                        "exchange_segment": config.CM_SEGMENT
+                    })
 
-        actual_exit = self.opt_mgr.place_exit_order(
-            token=self.option_token, strike=self.strike,
-            direction=self.direction, qty=self.qty, reason=reason,
-        )
-        exit_price = actual_exit if actual_exit else exit_ltp
+            if not instruments:
+                continue
 
-        pts_gained = round(exit_price - self.entry_price, 2)
-        pnl_rs     = round(pts_gained * self.qty, 2)
-        cost       = OptionManager.calc_trade_cost(
-            self.entry_price, exit_price, self.qty)
-        net_rs     = round(pnl_rs - cost, 2)
+            scanned = 0
+            try:
+                for i in range(0, len(instruments), 50):
+                    if not self._running:
+                        break
+                    batch = instruments[i:i+50]
+                    resp  = self.client.quotes(
+                        instrument_tokens=batch,
+                        quote_type="ltp",
+                    )
+                    items = []
+                    if isinstance(resp, dict):
+                        items = resp.get("data", resp.get("success", []))
+                    elif isinstance(resp, list):
+                        items = resp
 
-        self.day_pnl_rs += net_rs
-        self.cap_mgr.update_after_trade(net_rs)
-        duration = round((exit_time - self.entry_time).total_seconds() / 60, 1)
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        tok = str(item.get("instrument_token") or
+                                  item.get("tk") or item.get("token") or "")
+                        if not tok:
+                            continue
+                        ltp_val = self._extract_ltp(item)
+                        ap_val  = self._extract_ap(item)
+                        if ltp_val <= 0:
+                            continue
 
-        is_sl = reason in ("SL", "Trail SL")
-        if is_sl:
-            self.consec_sl += 1
-        else:
-            self.consec_sl = 0
+                        # Find symbol for this token
+                        # _all_scrips is a dict: symbol -> {token, symbol, ...}
+                        symbol = None
+                        scrips_iter = (self._all_scrips.values()
+                                       if isinstance(self._all_scrips, dict)
+                                       else self._all_scrips)
+                        for scrip in scrips_iter:
+                            if str(scrip.get("token")) == tok:
+                                symbol = scrip.get("symbol") or scrip.get("trading_symbol", "")
+                                break
 
-        trend_det = self.futures_engine.vwap_trend_detail()
+                        if not symbol:
+                            continue
 
-        print(f"\n{'='*55}")
-        print(f"  EXIT #{self.trade_count} — {reason}")
-        print(f"  {self.direction} {self.strike}  "
-              f"{self.entry_time.strftime('%H:%M:%S')}→"
-              f"{exit_time.strftime('%H:%M:%S')}  ({duration}m)")
-        print(f"  Entry={self.entry_price:.2f}  "
-              f"Exit={exit_price:.2f}  Peak={self.peak_price:.2f}")
-        print(f"  P&L : {pts_gained:+.2f}pts  =  Rs{pnl_rs:+.0f}  "
-              f"Cost={cost:.0f}  Net=Rs{net_rs:+.0f}")
-        print(f"  Day P&L: Rs{self.day_pnl_rs:+,.0f}  "
-              f"ConsecSL={self.consec_sl}")
-        print(f"{'='*55}\n")
+                        # Add tracker if not yet tracked
+                        tracker = self.vwap_mgr.get_tracker(symbol)
+                        if not tracker:
+                            self.vwap_mgr.add_stock(
+                                symbol        = symbol,
+                                token         = tok,
+                                gap_direction = "NONE",
+                            )
 
-        self.telegram.alert_exit(
-            direction=self.direction, strike=self.strike,
-            entry_price=self.entry_price, exit_price=exit_price,
-            pnl_pts=pts_gained, net_rs=net_rs, reason=reason,
-        )
+                        synthetic_tick = {"ltp": ltp_val, "ap": ap_val}
+                        self.vwap_mgr.on_tick(tok, synthetic_tick, from_ws=False)
 
-        self.report_mgr.log_trade({
-            "entry_time"              : self.entry_time,
-            "exit_time"               : exit_time,
-            "direction"               : self.direction,
-            "strike"                  : self.strike,
-            "expiry"                  : self.opt_mgr.expiry_str,
-            "atm_at_entry"            : round(self.entry_vwap / 50) * 50,
-            "entry_price"             : self.entry_price,
-            "exit_price"              : exit_price,
-            "peak_price"              : self.peak_price,
-            "low_price"               : self.low_price,
-            "entry_vwap"              : self.entry_vwap,
-            "exit_vwap"               : self.futures_engine.vwap,
-            "entry_dist"              : round(
-                abs(self.futures_engine.ltp - self.entry_vwap), 2),
-            "futures_at_entry"        : self.futures_engine.ltp,
-            "futures_at_exit"         : self.futures_engine.ltp,
-            "pnl_rs"                  : pnl_rs,
-            "total_cost"              : cost,
-            "net_rs"                  : net_rs,
-            "exit_reason"             : reason,
-            "exit_phase"              : reason,
-            "breakeven_done"          : self.trail_active,
-            "trail_active"            : self.trail_active,
-            "trail_step_reached"      : self.trail_step,
-            "signal_type"             : "vwap_touch",
-            "session"                 : "NORMAL",
-            "sl_pts_used"             : config.SL_PTS,
-            "target_pts_used"         : config.TARGET_PTS,
-            "sl_price"                : self.entry_price - config.SL_PTS,
-            "target_price"            : self.entry_price + config.TARGET_PTS,
-            "vwap_trend_at_entry"     : trend_det.get("trend", ""),
-            "early_trade_count"       : "",
-            "pullback_count_at_entry" : self.trade_count,
-            "high_vix"                : self.high_vix,
-        })
+                        if self.trade_mgr.can_enter(symbol, "VWAP_TREND_LONG",
+                                                    gap_direction="NONE"):
+                            self._check_entry_signal(tok, ltp_val)
 
-        if self.option_token:
-            self._unsubscribe_option(self.option_token)
-            self.option_token = None
+                        scanned += 1
 
-        # If the entry window is already closed and this was the last trade,
-        # the run-loop will detect in_trade=False on its next iteration and
-        # shut down. Print a hint so the user knows what's happening.
-        win_end = datetime.time(*map(int, config.ENTRY_WINDOW_END.split(":")))
-        if exit_time.time() > win_end:
-            print(f"[Main] Trade closed after entry window — "
-                  f"shutting down momentarily.")
+                    time.sleep(0.1)   # brief pause between batches
 
-    # ──────────────────────────────────────────────────────
-    # Helpers
-    # ──────────────────────────────────────────────────────
+                self.logger.debug(f"[TrendScan] Scanned {scanned} non-gap stocks")
 
-    def _is_market_hours(self, t: datetime.datetime) -> bool:
-        open_t  = datetime.time(*map(int, config.MARKET_OPEN.split(":")))
-        close_t = datetime.time(*map(int, config.SQUARE_OFF_TIME.split(":")))
-        return open_t <= t.time() <= close_t
+            except Exception as e:
+                self.logger.warning(f"[TrendScan] Error: {e}")
+
+    # ── EARLY_TREND scan loop (9:15–10:00, every 10s) ────
+
+    def _early_trend_scan_loop(self):
+        """
+        EARLY_TREND STRATEGY — runs independently of the main gap strategy.
+
+        WHAT IT DOES:
+          From 9:15 AM, scans ALL watchlist stocks every 10 seconds.
+          Filters for stocks with ≥2% gap (up or down) AND price ≥ Rs300.
+          Tracks VWAP for each qualifying stock.
+          When VWAP shows 3 consecutive rising bars (gap-up) or 3 consecutive
+          falling bars (gap-down), AND price pulls back into VWAP ± 0.2%,
+          enters in the direction of the gap:
+            - GAP_UP  → LONG (ride the uptrend)
+            - GAP_DOWN → SHORT (ride the downtrend)
+          SL: 0.7% fixed. Target: 1.5% fixed. No trailing stop.
+          Entries stop at 10:00 AM. Open positions managed until normal sq-off.
+          Max 8 EARLY_TREND trades open simultaneously.
+
+        WHY SEPARATE FROM MAIN STRATEGY:
+          The main strategy entry window is 9:30 AM.
+          This strategy exploits the 9:15–9:20 window where strong
+          trending stocks establish their VWAP direction before entry opens.
+          Different SL/target (tighter) suited to early morning volatility.
+        """
+        # Thread is started from run_gap_scan() which fires at 9:15 market open.
+        # No wait needed — scan starts immediately.
+        print("[EarlyTrend] Scan loop started — every 10s  "
+              "filter: gap≥2%, price≥Rs300, VWAP rising/falling")
+
+        # Build token→symbol reverse map for fast lookup
+        # _all_scrips: symbol → {token, symbol, ...}
+        token_to_symbol: Dict[str, str] = {}
+        scrips_iter = (self._all_scrips.values()
+                       if isinstance(self._all_scrips, dict)
+                       else self._all_scrips)
+        for scrip in scrips_iter:
+            tok = str(scrip.get("token") or scrip.get("instrument_token") or "")
+            sym = scrip.get("symbol") or scrip.get("trading_symbol") or ""
+            if tok and sym:
+                token_to_symbol[tok] = sym.upper()
+
+        # We need prev_close to compute gap %.
+        # Wait for the gap scanner to have prev_close data (it loads at first scan).
+        # We re-use gap_scanner._prev_close once available.
+        scan_interval = getattr(config, "EARLY_TREND_SCAN_INTERVAL", 10)
+        min_gap       = getattr(config, "EARLY_TREND_MIN_GAP_PCT",    2.0) / 100.0
+        min_price     = getattr(config, "EARLY_TREND_MIN_PRICE",      300.0)
+        vwap_bars_req = getattr(config, "EARLY_TREND_VWAP_BARS",      3)
+        band_pct      = getattr(config, "EARLY_TREND_BAND_PCT",        0.2) / 100.0
+
+        last_scan_time = None
+
+        while self._running:
+            time.sleep(0.5)   # tight loop, check every 0.5s
+            if not self._running:
+                break
+
+            t = now_ist()
+
+            # Only scan between 9:15 and 10:00
+            if t.time() < datetime.time(9, 15):
+                continue
+            if t.time() >= self._early_trend_stop_t:
+                # After 10:00 — stop new entries but keep monitoring open trades
+                self._early_trend_open = False
+                # No more scanning needed for entries
+                break
+
+            # Entry window gate (9:20–10:00)
+            self._early_trend_open = (t.time() >= self._early_trend_start_t)
+
+            # Respect scan interval
+            if last_scan_time and (t - last_scan_time).total_seconds() < scan_interval:
+                continue
+            last_scan_time = t
+
+            # Need prev_close data — if gap_scanner doesn't have it yet, skip
+            if not self.gap_scanner or not self.gap_scanner._prev_close:
+                continue
+
+            prev_close_map = self.gap_scanner._prev_close  # symbol → float
+
+            # Build instrument list — all scrips with prev_close
+            instruments = []
+            scrips_iter2 = (self._all_scrips.values()
+                            if isinstance(self._all_scrips, dict)
+                            else self._all_scrips)
+            for scrip in scrips_iter2:
+                tok = str(scrip.get("token") or
+                          scrip.get("instrument_token") or "")
+                sym = (scrip.get("symbol") or
+                       scrip.get("trading_symbol") or "").upper()
+                if not tok or not sym:
+                    continue
+                if sym not in prev_close_map:
+                    continue
+                instruments.append({
+                    "instrument_token": tok,
+                    "exchange_segment": config.CM_SEGMENT,
+                    "_symbol"         : sym,
+                })
+
+            if not instruments:
+                continue
+
+            try:
+                for i in range(0, len(instruments), 50):
+                    if not self._running:
+                        break
+                    batch = instruments[i:i+50]
+                    inst_batch = [{"instrument_token": x["instrument_token"],
+                                   "exchange_segment": x["exchange_segment"]}
+                                  for x in batch]
+                    try:
+                        resp  = self.client.quotes(
+                            instrument_tokens=inst_batch,
+                            quote_type="ltp",
+                        )
+                    except Exception as e:
+                        self.logger.warning(f"[EarlyTrend] quotes error: {e}")
+                        continue
+
+                    items = []
+                    if isinstance(resp, dict):
+                        items = resp.get("data", resp.get("success", []))
+                    elif isinstance(resp, list):
+                        items = resp
+
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        tok = str(item.get("instrument_token") or
+                                  item.get("tk") or item.get("token") or "")
+                        if not tok:
+                            continue
+
+                        ltp_val = self._extract_ltp(item)
+                        ap_val  = self._extract_ap(item)
+                        if ltp_val <= 0:
+                            continue
+
+                        # Price filter
+                        if ltp_val < min_price:
+                            continue
+
+                        sym = token_to_symbol.get(tok)
+                        if not sym:
+                            continue
+
+                        pc = prev_close_map.get(sym, 0)
+                        if pc <= 0:
+                            continue
+
+                        gap = (ltp_val - pc) / pc   # signed
+
+                        # Gap filter
+                        if abs(gap) < min_gap:
+                            continue
+
+                        direction = "LONG" if gap > 0 else "SHORT"
+
+                        # Register in universe
+                        if tok not in self._early_trend_universe:
+                            self._early_trend_universe[tok] = {
+                                "symbol"   : sym,
+                                "token"    : tok,
+                                "gap_pct"  : round(gap * 100, 2),
+                                "direction": "GAP_UP" if gap > 0 else "GAP_DOWN",
+                                "prev_close": pc,
+                            }
+                            self._early_vwap_history[tok] = []
+
+                        # Feed tick to VWAP engine for tracking
+                        synthetic = {"ltp": ltp_val, "ap": ap_val}
+                        self.vwap_mgr.on_tick(tok, synthetic, from_ws=False)
+
+                        # Ensure tracker exists
+                        if not self.vwap_mgr.get_tracker(sym):
+                            self.vwap_mgr.add_stock(
+                                symbol        = sym,
+                                token         = tok,
+                                gap_direction = self._early_trend_universe[tok]["direction"],
+                            )
+                            self.vwap_mgr.on_tick(tok, synthetic, from_ws=False)
+
+                        tracker = self.vwap_mgr.get_tracker(sym)
+                        if not tracker or tracker.vwap <= 0:
+                            continue
+
+                        # Track VWAP history for slope detection
+                        hist = self._early_vwap_history.setdefault(tok, [])
+                        hist.append(tracker.vwap)
+                        # Keep only last vwap_bars_req + 1 values
+                        if len(hist) > vwap_bars_req + 2:
+                            hist.pop(0)
+
+                        # Check EARLY_TREND entry conditions
+                        if not self._early_trend_open:
+                            continue   # before 9:20 — build history but don't enter
+                        if self.trade_mgr.day_stopped:
+                            continue
+
+                        # Check existing position in this symbol
+                        if sym in self.trade_mgr._open:
+                            continue
+
+                        # Need enough VWAP history
+                        if len(hist) < vwap_bars_req:
+                            continue
+
+                        # VWAP direction check — last N bars must be
+                        # all rising (LONG) or all falling (SHORT)
+                        recent = hist[-vwap_bars_req:]
+                        if direction == "LONG":
+                            vwap_trending = all(
+                                recent[j] < recent[j+1]
+                                for j in range(len(recent)-1)
+                            )
+                        else:
+                            vwap_trending = all(
+                                recent[j] > recent[j+1]
+                                for j in range(len(recent)-1)
+                            )
+
+                        if not vwap_trending:
+                            continue
+
+                        # Pullback to VWAP zone check: price must be within ±band_pct of VWAP
+                        vwap     = tracker.vwap
+                        dist_pct = abs(ltp_val - vwap) / vwap
+                        if dist_pct > band_pct:
+                            continue
+
+                        # For LONG: price should be at or just above VWAP (pullback)
+                        # For SHORT: price should be at or just below VWAP (bounce)
+                        if direction == "LONG" and ltp_val < vwap * (1 - band_pct):
+                            continue
+                        if direction == "SHORT" and ltp_val > vwap * (1 + band_pct):
+                            continue
+
+                        # Slot check
+                        if not self.trade_mgr.can_enter(
+                                sym, "EARLY_TREND",
+                                gap_direction=self._early_trend_universe[tok]["direction"],
+                                entry_direction=direction):
+                            continue
+
+                        gap_info = self._early_trend_universe[tok]
+
+                        self.logger.info(
+                            f"[EarlyTrend] SIGNAL {direction} {sym}  "
+                            f"ltp={ltp_val:.2f} vwap={vwap:.2f}  "
+                            f"dist={dist_pct*100:.3f}%  "
+                            f"gap={gap_info['gap_pct']:+.2f}%  "
+                            f"vwap_hist={[round(v,2) for v in recent]}"
+                        )
+                        print(f"\n🌅 EARLY_TREND SIGNAL: {direction} {sym}  "
+                              f"LTP Rs{ltp_val:.2f}  VWAP Rs{vwap:.2f}  "
+                              f"dist {dist_pct*100:.3f}%  "
+                              f"gap {gap_info['gap_pct']:+.2f}%")
+
+                        trade = self.trade_mgr.enter(
+                            symbol        = sym,
+                            token         = tok,
+                            direction     = direction,
+                            ltp           = ltp_val,
+                            vwap          = vwap,
+                            gap_pct       = gap_info["gap_pct"],
+                            gap_direction = gap_info["direction"],
+                            signal_type   = "EARLY_TREND",
+                        )
+
+                        if trade:
+                            self.telegram.alert_entry(
+                                symbol    = sym,
+                                direction = direction,
+                                gap_dir   = gap_info["direction"],
+                                entry     = trade.entry_price,
+                                vwap      = vwap,
+                                sl        = trade.sl_price,
+                                target    = trade.target_price,
+                                qty       = trade.qty,
+                                gap_pct   = gap_info["gap_pct"],
+                            )
+
+                    time.sleep(0.1)
+
+            except Exception as e:
+                self.logger.warning(f"[EarlyTrend] scan error: {e}",
+                                    exc_info=True)
+
+        self._early_trend_open = False
+        print("[EarlyTrend] Entry window closed (10:00 AM). "
+              "Open positions continue under normal management.")
+
+    # ── Helper: extract LTP + AP from REST response ───────
+
+    def _extract_ltp(self, item: dict) -> float:
+        ltp_data = item.get("ltp")
+        if isinstance(ltp_data, dict):
+            for f in ("ltp", "ltP", "lp"):
+                v = ltp_data.get(f)
+                if v:
+                    try:
+                        val = float(v)
+                        if val > 0:
+                            return val
+                    except (TypeError, ValueError):
+                        pass
+        for f in ("ltp", "ltP", "lp", "last_price"):
+            v = item.get(f)
+            if v and not isinstance(v, dict):
+                try:
+                    val = float(v)
+                    if val > 0:
+                        return val
+                except (TypeError, ValueError):
+                    pass
+        return 0.0
+
+    def _extract_ap(self, item: dict) -> float:
+        for f in ("ap", "atp", "aP", "avg_price"):
+            v = item.get(f)
+            if v and not isinstance(v, dict):
+                try:
+                    val = float(v)
+                    if val > 0:
+                        return val
+                except (TypeError, ValueError):
+                    pass
+        return 0.0
+
+    # ── Reconnect ─────────────────────────────────────────
 
     def _on_reconnect(self, new_client):
-        self.client         = new_client
-        self.opt_mgr.client = new_client
+        # Detach callbacks from the OLD client so stale StartServer objects
+        # cannot fire on_open / on_message and raise "Connection is already closed".
+        try:
+            self.client.on_message = None
+            self.client.on_error   = None
+            self.client.on_close   = None
+            self.client.on_open    = None
+        except Exception:
+            pass
+
+        self.client              = new_client
+        self.trade_mgr.client    = new_client
+        self.gap_scanner.client  = new_client
+        self._ws_connected       = False
+        self._ws_reconnecting    = False  # session manager owns this reconnect
         self._setup_websocket()
         time.sleep(2)
-        self._resubscribe_all()
+        all_tokens = [
+            {"instrument_token": tok, "exchange_segment": config.CM_SEGMENT}
+            for tok in self._subscribed_tokens
+        ]
+        total = len(all_tokens)
+        print(f"[Reconnect] Re-subscribing {total} tokens...")
+        for i in range(0, total, 50):
+            batch = all_tokens[i:i+50]
+            try:
+                self.client.subscribe(
+                    instrument_tokens=batch,
+                    isIndex=False,
+                    isDepth=False,
+                )
+            except Exception as e:
+                self.logger.error(f"[Reconnect] Subscribe batch error: {e}")
+            time.sleep(1.0)
+        print(f"[Reconnect] ✅ Session restored")
 
-    def _square_off_all(self):
-        if self.in_trade:
-            print(f"\n[SquareOff] {config.SQUARE_OFF_TIME} — "
-                  f"closing {self.direction} {self.strike}")
-            ltp = self.option_ltp if self.option_ltp > 0 else self.entry_price
-            self._exit_trade(ltp, f"Square-off {config.SQUARE_OFF_TIME}")
-
-    def _end_of_day(self):
-        print("\n" + "="*60 + "\n  END OF DAY")
-        print(f"  Signals fired  : {self.futures_engine.signals_fired}")
-        print(f"  Trades taken   : {self.trade_count}")
-        print(f"  Day P&L        : Rs {self.day_pnl_rs:+,.0f}")
-        report = self.report_mgr.generate_daily_report()
-        print(report)
-        self.cap_mgr.print_status()
-        self.report_mgr.close()
-        self.telegram.alert_shutdown(
-            trades=self.trade_count, net_pnl=self.day_pnl_rs)
-
-    def _print_status(self):
-        t     = now_ist()
-        state = self.futures_engine.get_state()
-        det   = self.futures_engine.vwap_trend_detail()
-        f_ltp = state["ltp"]
-        vwap  = state["vwap"]
-        dist  = abs(f_ltp - vwap) if f_ltp > 0 and vwap > 0 else 0
-        pos   = "^" if state.get("was_above") else "v"
-        zone  = det.get("zone", "?")
-
-        # Window status label
-        win_start = datetime.time(*map(int, config.ENTRY_WINDOW_START.split(":")))
-        win_end   = datetime.time(*map(int, config.ENTRY_WINDOW_END.split(":")))
-        if t.time() < win_start:
-            window_lbl = f"Window opens {config.ENTRY_WINDOW_START}"
-        elif t.time() <= win_end:
-            window_lbl = f"WINDOW OPEN [{zone}]"
-        else:
-            window_lbl = "Window closed"
-
-        print(f"\n[{t.strftime('%H:%M:%S')}] "
-              f"F={f_ltp:.2f} VWAP={vwap:.2f}{pos} dist={dist:.1f}pts  "
-              f"{window_lbl}  "
-              f"Signals={self.futures_engine.signals_fired}  "
-              f"Trades={self.trade_count}  "
-              f"ConsecSL={self.consec_sl}", end="")
-
-        if self.in_trade:
-            unreal     = round((self.option_ltp - self.entry_price) * self.qty, 0)
-            trail_tag  = " [TRAIL]" if self.trail_active else ""
-            print(f"  |  {self.direction}{self.strike} "
-                  f"E={self.entry_price:.0f} L={self.option_ltp:.0f} "
-                  f"SL={self.sl_price:.0f} TGT={self.target_price:.0f} "
-                  f"Unreal=Rs{unreal:+.0f}{trail_tag}", end="")
-
-        print(f"  |  DayPnL=Rs{self.day_pnl_rs:+,.0f}")
+    def _is_market_hours(self, t: datetime.datetime) -> bool:
+        open_t = datetime.time(*map(int, config.MARKET_OPEN.split(":")))
+        return open_t <= t.time() <= self._sq_off_t
 
     def _check_no_tick(self):
         t       = now_ist()
         elapsed = (t - self._last_tick_time).total_seconds()
         if elapsed > 300 and self._is_market_hours(t) and not self._circuit_alerted:
-            msg = f"No tick for {elapsed/60:.0f} mins — circuit halt?"
+            msg = f"No tick for {elapsed/60:.0f} mins — circuit halt or WS issue?"
             self.logger.warning(f"[Circuit] {msg}")
             self.telegram.alert_risk(msg)
             self._circuit_alerted = True
 
+    def _print_status(self):
+        t = now_ist()
+        if self._entries_open:
+            entry_tag = "ENTRIES OPEN"
+        else:
+            entry_tag = f"entries open at {config.ENTRY_START}"
+
+        et_tag = ""
+        if t.time() < self._early_trend_start_t:
+            et_tag = "  [EarlyTrend: building history]"
+        elif self._early_trend_open:
+            early_open = sum(1 for tr in self.trade_mgr._open.values()
+                             if tr.signal_type == "EARLY_TREND")
+            et_tag = f"  [EarlyTrend: OPEN {early_open}/8]"
+        elif t.time() >= self._early_trend_stop_t:
+            et_tag = "  [EarlyTrend: CLOSED 10:00]"
+
+        watching = self.vwap_mgr.active_count
+        print(f"\n[{t.strftime('%H:%M:%S')}] "
+              f"Watching: {watching}  "
+              f"Open trades: {len(self.trade_mgr._open)}  "
+              f"Day P&L: Rs{self.trade_mgr.day_pnl_rs:+,.0f}  "
+              f"[{entry_tag}]{et_tag}")
+        if self.trade_mgr._open:
+            self.trade_mgr.print_status()
+
     def _handle_sigterm(self, signum, frame):
-        print(f"\n[Shutdown] Signal {signum} — stopping...")
+        print(f"\n[Shutdown] Signal {signum} received — stopping...")
         self._running = False
 
     def _graceful_shutdown(self):
-        print("\n[Shutdown] Saving and exiting...")
+        print("\n[Shutdown] Saving state and exiting...")
         try:
-            self._square_off_all()
+            self.trade_mgr.square_off_all()
         except Exception as e:
-            self.logger.error(f"square_off: {e}")
+            self.logger.error(f"[Shutdown] square_off error: {e}")
         try:
-            self._end_of_day()
+            report = self.report_mgr.generate_daily_report()
+            print(report)
         except Exception as e:
-            self.logger.error(f"end_of_day: {e}")
+            self.logger.error(f"[Shutdown] report error: {e}")
+        try:
+            self.report_mgr.close()
+        except Exception:
+            pass
         try:
             if self.session_mgr:
                 self.session_mgr.stop()
         except Exception:
             pass
+        self.telegram.alert_shutdown(
+            trades  = self.trade_mgr.trade_count,
+            net_pnl = self.trade_mgr.day_pnl_rs,
+        )
         print("[Shutdown] Done.")
-        import os as _os
-        _os._exit(0)
+        os._exit(0)
 
-    # ──────────────────────────────────────────────────────
-    # Main loop
-    # ──────────────────────────────────────────────────────
+    # ── Main Loop ─────────────────────────────────────────
 
     def run(self):
         self.initialize()
-        self._subscribe_futures()
 
-        print(f"[Main] Watching VWAP from {config.MARKET_OPEN} IST")
-        print(f"[Main] Entry window  : "
-              f"{config.ENTRY_WINDOW_START}–{config.ENTRY_WINDOW_END} IST")
-        print(f"[Main] Square-off at : {config.SQUARE_OFF_TIME} IST\n")
+        gap_scanned      = False
+        last_status_min  = -1
+        sq_done          = False
+        consec_sl_paused = False
+        consec_sl_resume = None
+        last_rescan_time = None
 
-        sq_done                  = False
-        last_status_min          = -1
-        last_save_min            = -1
-        _window_close_announced  = False   # one-time "window closed" banner
+        print(f"[Main] Running — waiting for {config.MARKET_OPEN} IST...\n")
 
         try:
             while self._running:
-                t       = now_ist()
-                now_t   = t.time()
-                win_end = datetime.time(*map(int, config.ENTRY_WINDOW_END.split(":")))
-                sq_time = datetime.time(*map(int, config.SQUARE_OFF_TIME.split(":")))
+                t = now_ist()
 
-                # ── Hard auto-shutdown (safety net) ───────────────
                 if t >= self._shutdown_time:
-                    print(f"\n[Main] Auto-shutdown reached "
-                          f"({self._shutdown_time.strftime('%H:%M:%S')}) — exiting")
+                    print(f"\n[Main] Auto-shutdown time reached — stopping")
                     break
 
-                # ── 3:25 PM square-off safety net ─────────────────
-                if now_t >= sq_time and not sq_done:
-                    self._square_off_all()
-                    sq_done = True
+                # ── Gap scan ──────────────────────────────
+                market_open_t = datetime.time(*map(int, config.MARKET_OPEN.split(":")))
+                should_scan   = False
+                if not gap_scanned and t.time() >= market_open_t:
+                    should_scan = True
+                elif (gap_scanned
+                      and last_rescan_time is not None
+                      and not sq_done
+                      and (t - last_rescan_time).total_seconds() >= config.SCAN_INTERVAL_SECS):
+                    should_scan = True
 
-                # ── Post-window: entry window closed ──────────────
-                # Once 9:45 passes, print a one-time notice.
-                # As soon as the last trade exits (or if there was never
-                # an open trade), shut down cleanly — no point idling.
-                if now_t > win_end:
-                    if not _window_close_announced:
-                        print(f"\n{'='*55}")
-                        print(f"[Main] Entry window closed ({config.ENTRY_WINDOW_END}).")
-                        print(f"       VWAP tracked {self.futures_engine.tick_count} ticks  |  "
-                              f"Signals fired: {self.futures_engine.signals_fired}")
-                        if self.in_trade:
-                            print(f"       Trade still open — managing "
-                                  f"{self.direction} {self.strike} to SL/Target.")
-                        else:
-                            print(f"       No open trade — shutting down now.")
-                        print(f"{'='*55}")
-                        _window_close_announced = True
+                if should_scan:
+                    self.run_gap_scan()
+                    gap_scanned      = True
+                    last_rescan_time = t
+                    if t.time() >= self._entry_open_t and not self._entries_open:
+                        self._entries_open = True
+                        print(f"\n[Main] ✅ ENTRIES NOW OPEN — {t.strftime('%H:%M:%S')} IST")
 
-                    if not self.in_trade:
-                        # All done — exit cleanly
-                        break
+                # ── Open entries at 9:30 ──────────────────
+                if gap_scanned and not self._entries_open:
+                    if t.time() >= self._entry_open_t:
+                        self._entries_open = True
+                        print(f"\n[Main] ✅ ENTRIES NOW OPEN — {t.strftime('%H:%M:%S')} IST")
+                        print(f"[Main] Watching {self.vwap_mgr.active_count} stocks\n")
 
-                # ── Status every minute ───────────────────────────
-                if t.minute != last_status_min:
+                # ── Resume after consec SL pause ──────────
+                if consec_sl_paused and consec_sl_resume:
+                    if t >= consec_sl_resume:
+                        consec_sl_paused           = False
+                        consec_sl_resume           = None
+                        self.trade_mgr.consec_sl   = 0
+                        # Re-open entries after consec SL pause lifts
+                        if True:
+                            self._entries_open = True
+                            print(f"\n[Guard] Consec SL pause lifted — entries re-enabled")
+
+                # ── Pause on consec SL ─────────────────────
+                if (self.trade_mgr.consec_sl >= config.MAX_CONSEC_SL
+                        and not consec_sl_paused
+                        and not self.trade_mgr.day_stopped):
+                    consec_sl_paused = True
+                    consec_sl_resume = t + datetime.timedelta(minutes=30)
+                    self._entries_open = False
+                    print(f"\n[Guard] {config.MAX_CONSEC_SL} consecutive SLs — "
+                          f"pausing entries for 30 min (resume {consec_sl_resume.strftime('%H:%M')})")
+
+                # ── Square off at 15:10 ───────────────────
+                if t.time() >= self._sq_off_t and not sq_done:
+                    print(f"\n[Main] {config.SQUARE_OFF_TIME} — squaring off all positions")
+                    self.trade_mgr.square_off_all()
+                    self._entries_open = False
+                    sq_done            = True
+                    self._running      = False
+
+                # ── Status print every minute ─────────────
+                if gap_scanned and t.minute != last_status_min:
                     self._print_status()
                     self._check_no_tick()
                     last_status_min = t.minute
 
-                # ── Autosave every 30 min ─────────────────────────
-                if t.minute % 30 == 0 and t.minute != last_save_min:
-                    self.cap_mgr._save()
-                    last_save_min = t.minute
-
                 time.sleep(1)
 
         except KeyboardInterrupt:
-            print("\n[Main] Keyboard interrupt")
+            print("\n[Main] Keyboard interrupt — shutting down")
         finally:
             self._graceful_shutdown()
 
 
+# ──────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    algo = FuturesVWAPAlgo()
+    algo = GapVWAPAlgo()
     algo.run()
