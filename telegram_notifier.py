@@ -19,8 +19,8 @@ except ImportError:
 class TelegramNotifier:
 
     def __init__(self):
-        self.token   = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-        self.chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+        self.token   = os.getenv("TELEGRAM_B_BOT_TOKEN", "").strip()
+        self.chat_id = os.getenv("TELEGRAM_B_CHAT_ID", "").strip()
         self.enabled = bool(self.token and self.chat_id and _URLLIB_OK)
 
         if self.enabled:

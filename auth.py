@@ -16,7 +16,7 @@ from neo_api_client import NeoAPI
 
 logger = logging.getLogger(__name__)
 
-TOTP_SECRET_KEY = os.getenv("TOTP_SECRET_KEY", "")
+TOTP_SECRET_KEY = os.getenv("KOTAK_B_TOTP_SECRET_KEY", "")
 
 
 def _is_interactive() -> bool:

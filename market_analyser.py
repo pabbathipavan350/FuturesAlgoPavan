@@ -40,6 +40,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("market_analyser")
 
+# Suppress urllib3 connection pool debug spam
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("urllib3.connectionpool").setLevel(logging.WARNING)
+
 
 # ── IST helpers ──────────────────────────────────────────────
 def now_ist() -> datetime.datetime:

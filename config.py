@@ -70,15 +70,15 @@ PAPER_TRADE         = True     # Set False only when ready for live
 # Motivation: if the algo is losing consistently, the signal may
 # have reliable directional edge IN REVERSE.
 # Set FLIP_SIGNALS = False to revert to original logic instantly.
-FLIP_SIGNALS        = True     # ← master flip switch
+FLIP_SIGNALS        = False    # ← Original direction — no flip
 FLIP_SL_RS          = 900      # Rs fixed SL in flip mode (hard stop per trade)
 
 # ── Kotak Neo Credentials (from .env) ─────────────────────
-KOTAK_CONSUMER_KEY    = os.getenv("KOTAK_CONSUMER_KEY",    "")
-KOTAK_MOBILE_NUMBER   = os.getenv("KOTAK_MOBILE_NUMBER",   "")
-KOTAK_UCC             = os.getenv("KOTAK_UCC",             "")
-KOTAK_MPIN            = os.getenv("KOTAK_MPIN",            "")
-KOTAK_ENVIRONMENT     = os.getenv("KOTAK_ENVIRONMENT",     "prod")
+KOTAK_CONSUMER_KEY    = os.getenv("KOTAK_B_CONSUMER_KEY",    "")
+KOTAK_MOBILE_NUMBER   = os.getenv("KOTAK_B_MOBILE_NUMBER",   "")
+KOTAK_UCC             = os.getenv("KOTAK_B_UCC",             "")
+KOTAK_MPIN            = os.getenv("KOTAK_B_MPIN",            "")
+KOTAK_ENVIRONMENT     = os.getenv("KOTAK_B_ENVIRONMENT",     "prod")
 
 # ── Capital & Position Sizing ─────────────────────────────
 TOTAL_CAPITAL        = 200_000   # Rs 2,00,000 real capital
